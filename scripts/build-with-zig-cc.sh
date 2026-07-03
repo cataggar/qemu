@@ -48,6 +48,12 @@ case "$(uname -m)" in
 esac
 
 mkdir -p "$BUILD_DIR"
+# Canonicalize to an absolute path: we `cd "$BUILD_DIR"` below, and a
+# relative BUILD_DIR (e.g. a caller passing "build-zig") would otherwise
+# make the -I flag below resolve against the wrong (post-cd) directory,
+# silently failing to find the header copy and falling back to the host's
+# (possibly older) /usr/include/linux headers -- see workaround (3) above.
+BUILD_DIR="$(cd "$BUILD_DIR" && pwd)"
 
 # (3) Real copy of linux-headers at a distinct path, plus the asm symlink.
 HDR_COPY="$BUILD_DIR/zig-linux-headers-copy"
