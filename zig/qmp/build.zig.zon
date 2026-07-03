@@ -1,0 +1,14 @@
+.{
+    .name = .qmp,
+    .version = "0.1.0",
+    .fingerprint = 0x2a24bfa3ff414e0b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
