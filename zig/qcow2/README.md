@@ -14,7 +14,7 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 - [x] Compressed clusters (deflate / zstd)
 - [x] `info` / `map` / `read` CLI
 - [x] Backing-file chains
-- [ ] Extended L2 (subcluster) entries
+- [x] Extended L2 (subcluster) entries
 - [x] Writer / image creation (`convert` raw → qcow2)
 
 ## Build & test
@@ -39,14 +39,23 @@ qcow2 convert <raw_in> <qcow2_out> create a qcow2 image from a raw file
 ## Validation against qemu-img
 
 The reader is cross-checked against the `qemu-img` binary built from this tree
-with `zig cc` (the `zig16` branch). For example:
+with `zig cc`. For example:
 
 ```sh
-# create a qcow2, write a known pattern via a raw round-trip
-qemu-img create -f qcow2 disk.qcow2 64M
-# ... populate, then compare:
-qcow2 read disk.qcow2 0 4096 | cmp - <(qemu-img dd ... )
+# create an Extended L2 qcow2, populate a few subclusters, then compare
+qemu-img create -f qcow2 -o extended_l2=on,cluster_size=64k ext.qcow2 4M
+qemu-io -c "write -s pattern.bin 0 2048" ext.qcow2
+qemu-io -c "write -z 4096 2048" ext.qcow2
+qemu-img convert -O raw ext.qcow2 expected.raw
+qcow2 read ext.qcow2 0 4194304 | cmp - expected.raw
 ```
+
+This has been verified byte-for-byte (via `cmp`) against real `qemu-img`/
+`qemu-io`-produced images for: standard v3 images, Extended L2 images with
+mixed allocated/zero/unallocated subclusters across multiple L2 tables,
+Extended L2 + backing-file chains, and — in the other direction — images
+produced by this crate's own writer (`extended_l2 = true`) opened and
+`check`ed/`convert`ed successfully by `qemu-img`.
 
 ## Library usage
 

@@ -3,6 +3,8 @@
 //! Builds a valid qcow2 v3 image in memory from raw guest data, then writes it
 //! to a file. Produces refcount table/blocks, L1/L2 tables, and data clusters.
 //! All-zero guest clusters are left unallocated (they read back as zeros).
+//! Optionally emits Extended L2 Entries (`CreateOptions.extended_l2`), with
+//! every subcluster of an allocated cluster marked allocated.
 //!
 //! Scope: uncompressed v3 images without a backing file, snapshots, or
 //! encryption. Validated against `qemu-img check` / `qemu-img convert`.
@@ -15,6 +17,11 @@ const oflag_copied: u64 = @as(u64, 1) << 63; // refcount is exactly one
 
 pub const CreateOptions = struct {
     cluster_bits: u5 = 16, // 64 KiB clusters
+    /// Emit Extended L2 Entries (16-byte L2 entries with a per-subcluster
+    /// allocation bitmap) instead of standard 8-byte entries. Every
+    /// subcluster of an allocated cluster is marked allocated (no zero
+    /// subclusters are produced); `cluster_bits` must be >= 14.
+    extended_l2: bool = false,
 };
 
 /// Create a qcow2 image at `path` whose contents are `data` (zero-padded /
@@ -29,10 +36,12 @@ pub fn createFromRaw(
     opts: CreateOptions,
 ) !void {
     const cluster_bits: u6 = opts.cluster_bits;
+    if (opts.extended_l2 and cluster_bits < 14) return error.BadClusterBits;
     const cs: u64 = @as(u64, 1) << cluster_bits;
     // qcow2 virtual sizes are sector-granular; round up to 512 like qemu-img.
     const vsize = std.mem.alignForward(u64, virtual_size, 512);
-    const l2_entries: u64 = cs / 8;
+    const l2_entry_size: u64 = if (opts.extended_l2) 16 else 8;
+    const l2_entries: u64 = cs / l2_entry_size;
     const refcount_bits: u64 = 16;
     const rb_entries: u64 = cs * 8 / refcount_bits; // refcount block entries
 
@@ -102,7 +111,13 @@ pub fn createFromRaw(
 
         const datac = (try ctx.alloc()) * cs;
         @memcpy(file.items[@intCast(datac)..][0..avail], src);
-        ctx.put64(l2_off + l2_idx * 8, datac | oflag_copied);
+        const l2e_off = l2_off + l2_idx * l2_entry_size;
+        ctx.put64(l2e_off, datac | oflag_copied);
+        if (opts.extended_l2) {
+            // Every subcluster of this cluster is allocated (bits 0-31);
+            // no subcluster reads as zero (bits 32-63 stay clear).
+            ctx.put64(l2e_off + 8, 0xffff_ffff);
+        }
     }
 
     // Allocate refcount blocks to cover every cluster (including the blocks
@@ -151,6 +166,7 @@ pub fn createFromRaw(
         .l1_table_offset = l1_offset,
         .refcount_table_offset = rt_offset,
         .refcount_table_clusters = refcount_table_clusters,
+        .incompatible_features = if (opts.extended_l2) (@as(u64, 1) << 4) else 0,
     });
 
     // Flush to disk.
@@ -166,6 +182,7 @@ const HeaderFields = struct {
     l1_table_offset: u64,
     refcount_table_offset: u64,
     refcount_table_clusters: u64,
+    incompatible_features: u64 = 0,
 };
 
 fn writeHeader(buf: []u8, f: HeaderFields) void {
@@ -182,7 +199,7 @@ fn writeHeader(buf: []u8, f: HeaderFields) void {
     std.mem.writeInt(u32, buf[56..60], @intCast(f.refcount_table_clusters), .big);
     // nb_snapshots (60) = 0, snapshots_offset (64) = 0
     // v3 fields:
-    std.mem.writeInt(u64, buf[72..80], 0, .big); // incompatible_features
+    std.mem.writeInt(u64, buf[72..80], f.incompatible_features, .big);
     std.mem.writeInt(u64, buf[80..88], 0, .big); // compatible_features
     std.mem.writeInt(u64, buf[88..96], 0, .big); // autoclear_features
     std.mem.writeInt(u32, buf[96..100], 4, .big); // refcount_order = 4 (16-bit)
