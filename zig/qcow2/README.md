@@ -16,6 +16,8 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 - [x] Backing-file chains
 - [x] Extended L2 (subcluster) entries
 - [x] Writer / image creation (`convert` raw → qcow2)
+- [x] Refcount table + basic consistency check (`check`)
+- [ ] Snapshots (table parsing + read-only access)
 
 ## Build & test
 
@@ -33,6 +35,7 @@ zig build run -- info disk.qcow2
 qcow2 info <image>                 dump header + feature summary
 qcow2 map  <image> <offset>        classify the cluster at a guest offset
 qcow2 read <image> <offset> <len>  write raw guest bytes to stdout
+qcow2 check <image>                basic refcount/consistency check
 qcow2 convert <raw_in> <qcow2_out> create a qcow2 image from a raw file
 ```
 
@@ -55,7 +58,9 @@ This has been verified byte-for-byte (via `cmp`) against real `qemu-img`/
 mixed allocated/zero/unallocated subclusters across multiple L2 tables,
 Extended L2 + backing-file chains, and — in the other direction — images
 produced by this crate's own writer (`extended_l2 = true`) opened and
-`check`ed/`convert`ed successfully by `qemu-img`.
+`check`ed/`convert`ed successfully by `qemu-img`. `qcow2 check`'s clean/dirty
+verdict is also cross-checked against real `qemu-img check` on the same
+images (see `scripts/cross-validate.sh`).
 
 ## Library usage
 
