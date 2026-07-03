@@ -4,6 +4,7 @@
 //!   qcow2 map   <image> <offset>        classify the cluster at a guest offset
 //!   qcow2 read  <image> <offset> <len>  write `len` bytes from the guest disk
 //!                                        to stdout (raw)
+//!   qcow2 check <image>                 basic refcount/consistency check
 
 const std = @import("std");
 const Io = std.Io;
@@ -51,6 +52,11 @@ pub fn main(init: std.process.Init) !void {
         const buf = try arena.alloc(u8, len);
         try img.read(off, buf);
         try out.writeAll(buf);
+    } else if (std.mem.eql(u8, cmd, "check")) {
+        const clean = try checkCmd(out, arena, &img);
+        try out.flush();
+        if (!clean) return error.ChecksFailed;
+        return;
     } else {
         try usage(out);
         try out.flush();
@@ -77,6 +83,7 @@ fn usage(out: *Io.Writer) !void {
         \\  qcow2 info <image>
         \\  qcow2 map  <image> <offset>
         \\  qcow2 read <image> <offset> <len>   (raw bytes to stdout)
+        \\  qcow2 check <image>                 (basic refcount/consistency check)
         \\  qcow2 convert <raw_in> <qcow2_out>  (create qcow2 from a raw file)
         \\
     );
@@ -116,4 +123,37 @@ fn mapCmd(out: *Io.Writer, img: *qcow2.Image, off: u64) !void {
         const index = (off % h.clusterSize()) / h.subclusterSize();
         try out.print("subcluster:         {d} of {d}\n", .{ index, qcow2.Header.subclusters_per_cluster });
     }
+}
+
+/// `check <image>`: run Image.check and print a qemu-img-check-style
+/// summary. Returns whether the image was clean (used by main to decide the
+/// process exit code).
+fn checkCmd(out: *Io.Writer, allocator: std.mem.Allocator, img: *qcow2.Image) !bool {
+    var report = try img.check(allocator);
+    defer report.deinit(allocator);
+
+    if (report.isClean()) {
+        try out.print("No errors were found on the image.\n", .{});
+        try out.print("{d} clusters referenced.\n", .{report.allocated_clusters});
+        return true;
+    }
+
+    for (report.findings.items) |f| {
+        switch (f.kind) {
+            .used_cluster_zero_refcount => try out.print(
+                "ERROR: cluster {d} is used but has a stored refcount of 0\n",
+                .{f.cluster_index},
+            ),
+            .refcount_mismatch => try out.print(
+                "ERROR: cluster {d} has refcount {d}, but {d} reference(s) were found\n",
+                .{ f.cluster_index, f.stored, f.computed },
+            ),
+            .leaked_cluster => try out.print(
+                "Leaked cluster {d} refcount={d} (not referenced by any metadata)\n",
+                .{ f.cluster_index, f.stored },
+            ),
+        }
+    }
+    try out.print("{d} errors were found on the image.\n", .{report.findings.items.len});
+    return false;
 }
