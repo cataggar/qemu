@@ -16,6 +16,9 @@ const zstd = std.compress.zstd;
 
 pub const magic: u32 = 0x514649fb; // "QFI\xfb"
 
+/// Image creation / writer support.
+pub const writer = @import("writer.zig");
+
 /// Header field offsets and layout, per the qcow2 spec.
 pub const Header = struct {
     version: u32,
@@ -437,4 +440,31 @@ test "reject unknown incompatible feature" {
     std.mem.writeInt(u32, buf[100..104], 104, .big);
     std.mem.writeInt(u64, buf[72..80], @as(u64, 1) << 20, .big); // unknown bit
     try std.testing.expectError(error.UnknownIncompatibleFeature, Header.parse(&buf));
+}
+
+test "writer round-trip: create then read back" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Data spanning allocated + unallocated (zero) clusters.
+    const vsize: u64 = 512 * 1024;
+    const data = try a.alloc(u8, vsize);
+    defer a.free(data);
+    @memset(data, 0);
+    for (data[0..1000], 0..) |*b, i| b.* = @intCast(i % 251); // first cluster
+    for (data[300 * 1024 ..][0..2048], 0..) |*b, i| b.* = @intCast((i * 7) % 253);
+
+    try writer.createFromRaw(a, io, tmp.dir, "rt.qcow2", data, vsize, .{});
+
+    var img = try Image.open(a, io, tmp.dir, "rt.qcow2");
+    defer img.close();
+    try std.testing.expectEqual(vsize, img.header.size);
+
+    const out = try a.alloc(u8, vsize);
+    defer a.free(out);
+    try img.read(0, out);
+    try std.testing.expectEqualSlices(u8, data, out);
 }
