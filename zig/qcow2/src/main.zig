@@ -73,7 +73,7 @@ fn info(out: *Io.Writer, img: *qcow2.Image) !void {
     try out.print("has backing file:   {}\n", .{h.backing_file_offset != 0});
     try out.print("compression type:   {s}\n", .{if (h.compression_type == 1) "zstd" else "deflate"});
     try out.print("incompatible bits:  0x{x}\n", .{h.incompatible_features});
-    try out.print("  compressed clusters: {}\n", .{h.hasIncompatible(.compression_type)});
+    try out.print("  non-default compression: {}\n", .{h.hasIncompatible(.compression_type)});
     try out.print("  external data file:  {}\n", .{h.hasIncompatible(.external_data_file)});
     try out.print("  extended L2:         {}\n", .{h.hasIncompatible(.extended_l2)});
 }
@@ -83,7 +83,7 @@ fn mapCmd(out: *Io.Writer, img: *qcow2.Image, off: u64) !void {
     switch (m) {
         .unallocated => try out.writeAll("unallocated\n"),
         .zero => try out.writeAll("zero\n"),
-        .compressed => try out.writeAll("compressed\n"),
+        .compressed => |ref| try out.print("compressed @ 0x{x} ({d} bytes)\n", .{ ref.coffset, ref.csize }),
         .standard => |host| try out.print("standard @ host offset 0x{x}\n", .{host}),
     }
 }

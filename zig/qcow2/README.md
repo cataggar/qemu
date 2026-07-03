@@ -9,10 +9,10 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 ## Status
 
 - [x] Header parsing (v2 / v3), feature-bit validation
-- [x] L1/L2 cluster mapping (standard / zero / unallocated)
+- [x] L1/L2 cluster mapping (standard / zero / unallocated / compressed)
 - [x] `read(guest_offset, buf)` for uncompressed images
+- [x] Compressed clusters (deflate / zstd)
 - [x] `info` / `map` / `read` CLI
-- [ ] Compressed clusters (deflate / zstd)
 - [ ] Backing-file chains
 - [ ] Extended L2 (subcluster) entries
 - [ ] Writer / image creation
