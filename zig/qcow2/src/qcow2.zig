@@ -3,9 +3,9 @@
 //! A dependency-free, clean-room implementation of the qcow2 on-disk format
 //! (see `docs/interop/qcow2.rst` in the QEMU tree). No QEMU C code is used.
 //!
-//! Current scope: read path for v2/v3 images with standard, zero, and
-//! unallocated clusters. Compressed clusters and backing-file chains are
-//! detected and surfaced as explicit errors (implementation in progress).
+//! Scope: read path for v2/v3 images, including standard, zero, unallocated,
+//! and compressed clusters, backing-file chains, and Extended L2 Entries
+//! (per-subcluster allocation). See `writer.zig` for image creation.
 //!
 //! All multi-byte integers in qcow2 are stored big-endian.
 
@@ -50,13 +50,30 @@ pub const Header = struct {
         extended_l2 = 4,
     };
 
+    /// Number of subclusters per standard data cluster in Extended L2 images.
+    pub const subclusters_per_cluster: u64 = 32;
+
     pub fn clusterSize(self: Header) u64 {
         return @as(u64, 1) << @intCast(self.cluster_bits);
     }
 
-    /// Number of standard (8-byte) L2 entries per L2 table cluster.
+    /// Number of L2 entries per L2 table cluster. Extended L2 Entries
+    /// (incompatible bit 4) use 16-byte entries instead of 8, halving the
+    /// number of entries per table.
     pub fn l2Entries(self: Header) u64 {
-        return self.clusterSize() / @sizeOf(u64);
+        return self.clusterSize() / self.l2EntrySize();
+    }
+
+    /// Size in bytes of a single L2 entry: 16 for Extended L2 images, 8
+    /// otherwise.
+    pub fn l2EntrySize(self: Header) u64 {
+        return if (self.hasIncompatible(.extended_l2)) 16 else @sizeOf(u64);
+    }
+
+    /// Size in bytes of a subcluster. Only meaningful for Extended L2
+    /// images, which divide each standard data cluster into 32 subclusters.
+    pub fn subclusterSize(self: Header) u64 {
+        return self.clusterSize() / Header.subclusters_per_cluster;
     }
 
     pub fn hasIncompatible(self: Header, bit: IncompatibleBit) bool {
@@ -104,6 +121,12 @@ pub const Header = struct {
         if ((h.incompatible_features & ~known_incompatible) != 0)
             return error.UnknownIncompatibleFeature;
 
+        // Per spec: Extended L2 Entries require cluster_bits >= 14 (i.e.
+        // clusters of at least 16 KiB, so a 16-byte L2 entry still leaves
+        // room for a whole number of subclusters).
+        if (h.hasIncompatible(.extended_l2) and h.cluster_bits < 14)
+            return error.BadClusterBits;
+
         return h;
     }
 };
@@ -116,7 +139,6 @@ pub const Error = error{
     UnknownIncompatibleFeature,
     // Read path
     OutOfRange,
-    UnsupportedExtendedL2,
     UnsupportedCompressionType,
     CorruptMapping,
     DecompressFailed,
@@ -234,10 +256,13 @@ pub const Image = struct {
         self.* = undefined;
     }
 
-    /// Resolve the mapping for the guest cluster containing `guest_offset`.
+    /// Resolve the mapping for `guest_offset`. For standard clusters in an
+    /// Extended L2 image this resolves down to the *subcluster* containing
+    /// `guest_offset` (host offsets are adjusted to the subcluster's byte
+    /// offset); compressed clusters have no subclusters and are always
+    /// resolved at full cluster granularity.
     pub fn mapCluster(self: *Image, guest_offset: u64) !Mapping {
         if (guest_offset >= self.header.size) return error.OutOfRange;
-        if (self.header.hasIncompatible(.extended_l2)) return error.UnsupportedExtendedL2;
 
         const cs = self.header.clusterSize();
         const l2_entries = self.header.l2Entries();
@@ -250,15 +275,19 @@ pub const Image = struct {
         const l2_offset = l1_entry & l1e_offset_mask;
         if (l2_offset == 0) return .unallocated;
 
-        // Read the single L2 entry we need.
-        var entry_buf: [8]u8 = undefined;
-        const at = l2_offset + l2_index * @sizeOf(u64);
-        const got = try self.file.readPositionalAll(self.io, &entry_buf, at);
-        if (got != entry_buf.len) return error.CorruptMapping;
-        const l2_entry = std.mem.readInt(u64, &entry_buf, .big);
+        const ext_l2 = self.header.hasIncompatible(.extended_l2);
+        const entry_size = self.header.l2EntrySize();
+
+        // Read the single (8- or 16-byte) L2 entry we need.
+        var entry_buf: [16]u8 = undefined;
+        const at = l2_offset + l2_index * entry_size;
+        const got = try self.file.readPositionalAll(self.io, entry_buf[0..entry_size], at);
+        if (got != entry_size) return error.CorruptMapping;
+        const l2_entry = std.mem.readInt(u64, entry_buf[0..8], .big);
 
         if ((l2_entry & l2e_compressed) != 0) {
-            // Compressed cluster descriptor.
+            // Compressed cluster descriptor. Unaffected by Extended L2 (no
+            // subclusters for compressed clusters).
             //   csize_shift = 62 - (cluster_bits - 8)
             //   csize_mask  = (1 << (cluster_bits - 8)) - 1
             //   offset_mask = (1 << csize_shift) - 1
@@ -273,9 +302,26 @@ pub const Image = struct {
         }
 
         const host_offset = l2_entry & l2e_offset_mask;
-        if ((l2_entry & standard_zero_bit) != 0) return .zero;
-        if (host_offset == 0) return .unallocated;
-        return .{ .standard = host_offset };
+
+        if (!ext_l2) {
+            if ((l2_entry & standard_zero_bit) != 0) return .zero;
+            if (host_offset == 0) return .unallocated;
+            return .{ .standard = host_offset };
+        }
+
+        // Extended L2: bit 0 of the standard descriptor is unused (always
+        // 0); subcluster status instead comes from the second 8-byte
+        // allocation/zero bitmap.
+        const bitmap = std.mem.readInt(u64, entry_buf[8..16], .big);
+        const subcluster_size = self.header.subclusterSize();
+        const subcluster_index: u6 = @intCast((guest_offset % cs) / subcluster_size);
+        const alloc_bit = (bitmap >> subcluster_index) & 1;
+        const zero_bit = (bitmap >> (32 + subcluster_index)) & 1;
+
+        if (zero_bit != 0) return .zero;
+        if (alloc_bit == 0) return .unallocated;
+        if (host_offset == 0) return error.CorruptMapping; // allocated subcluster needs a valid offset
+        return .{ .standard = host_offset + @as(u64, subcluster_index) * subcluster_size };
     }
 
     /// Decompress the single guest cluster described by `ref` into `dst`,
@@ -320,18 +366,29 @@ pub const Image = struct {
 
     /// Read `buf.len` bytes starting at `guest_offset` from the virtual disk.
     /// Unallocated and zero clusters read as zeros (backing files not yet
-    /// followed). Compressed clusters are decoded in-place.
+    /// followed). Compressed clusters are decoded in-place. For Extended L2
+    /// images, standard/zero/unallocated status is resolved per-subcluster.
     pub fn read(self: *Image, guest_offset: u64, buf: []u8) !void {
         const cs = self.header.clusterSize();
+        const ext_l2 = self.header.hasIncompatible(.extended_l2);
+        const subcluster_size = if (ext_l2) self.header.subclusterSize() else cs;
         var pos: u64 = guest_offset;
         var written: usize = 0;
         while (written < buf.len) {
             if (pos >= self.header.size) return error.OutOfRange;
             const in_cluster = pos % cs;
-            const chunk = @min(cs - in_cluster, buf.len - written);
+            const mapping = try self.mapCluster(pos);
+
+            // Compressed clusters have no subclusters, so they're always
+            // resolved (and chunked) at full cluster granularity; everything
+            // else is safe to chunk at subcluster granularity for Extended
+            // L2 images (which is just the cluster size otherwise).
+            const region = if (std.meta.activeTag(mapping) == .compressed) cs else subcluster_size;
+            const in_region = pos % region;
+            const chunk = @min(region - in_region, buf.len - written);
             const dst = buf[written .. written + chunk];
 
-            switch (try self.mapCluster(pos)) {
+            switch (mapping) {
                 .zero => @memset(dst, 0),
                 .unallocated => try self.readBacking(pos, dst),
                 .compressed => |ref| {
@@ -345,7 +402,7 @@ pub const Image = struct {
                     const got = try self.file.readPositionalAll(
                         self.io,
                         dst,
-                        host_offset + in_cluster,
+                        host_offset + in_region,
                     );
                     if (got != dst.len) return error.Truncated;
                 },
@@ -396,6 +453,30 @@ fn rd64(buf: []const u8, off: usize) u64 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Test-only helper: write a minimal v3 header with the Extended L2
+/// incompatible bit set into `buf[0..104]`.
+const ExtL2HeaderOpts = struct {
+    cluster_bits: u32,
+    size: u64,
+    l1_size: u32,
+    l1_table_offset: u64,
+    backing_file_offset: u64 = 0,
+    backing_file_size: u32 = 0,
+};
+fn writeExtL2ImageHeader(buf: []u8, opts: ExtL2HeaderOpts) void {
+    @memset(buf[0..104], 0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big); // version
+    std.mem.writeInt(u64, buf[8..16], opts.backing_file_offset, .big);
+    std.mem.writeInt(u32, buf[16..20], opts.backing_file_size, .big);
+    std.mem.writeInt(u32, buf[20..24], opts.cluster_bits, .big);
+    std.mem.writeInt(u64, buf[24..32], opts.size, .big);
+    std.mem.writeInt(u32, buf[36..40], opts.l1_size, .big);
+    std.mem.writeInt(u64, buf[40..48], opts.l1_table_offset, .big);
+    std.mem.writeInt(u64, buf[72..80], @as(u64, 1) << 4, .big); // incompatible: extended_l2
+    std.mem.writeInt(u32, buf[100..104], 104, .big); // header_length
+}
 
 test "parse minimal v3 header" {
     var buf: [104]u8 = @splat(0);
@@ -467,4 +548,277 @@ test "writer round-trip: create then read back" {
     defer a.free(out);
     try img.read(0, out);
     try std.testing.expectEqualSlices(u8, data, out);
+}
+
+test "writer round-trip: extended L2 image, create then read back" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const vsize: u64 = 512 * 1024;
+    const data = try a.alloc(u8, vsize);
+    defer a.free(data);
+    @memset(data, 0);
+    for (data[0..1000], 0..) |*b, i| b.* = @intCast(i % 251); // first cluster
+    for (data[300 * 1024 ..][0..2048], 0..) |*b, i| b.* = @intCast((i * 7) % 253);
+
+    try writer.createFromRaw(a, io, tmp.dir, "ext-rt.qcow2", data, vsize, .{
+        .cluster_bits = 14,
+        .extended_l2 = true,
+    });
+
+    var img = try Image.open(a, io, tmp.dir, "ext-rt.qcow2");
+    defer img.close();
+    try std.testing.expectEqual(vsize, img.header.size);
+    try std.testing.expect(img.header.hasIncompatible(.extended_l2));
+    try std.testing.expectEqual(@as(u64, 16384 / 16), img.header.l2Entries());
+
+    const out = try a.alloc(u8, vsize);
+    defer a.free(out);
+    try img.read(0, out);
+    try std.testing.expectEqualSlices(u8, data, out);
+}
+
+test "writer: extended L2 requires cluster_bits >= 14" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = [_]u8{0} ** 16;
+    try std.testing.expectError(error.BadClusterBits, writer.createFromRaw(
+        a,
+        io,
+        tmp.dir,
+        "bad.qcow2",
+        &data,
+        data.len,
+        .{ .cluster_bits = 13, .extended_l2 = true },
+    ));
+}
+
+test "reject extended L2 with cluster_bits < 14" {
+    var buf: [104]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big);
+    std.mem.writeInt(u32, buf[20..24], 13, .big); // 8 KiB clusters: too small
+    std.mem.writeInt(u32, buf[100..104], 104, .big);
+    std.mem.writeInt(u64, buf[72..80], @as(u64, 1) << 4, .big); // extended_l2
+    try std.testing.expectError(error.BadClusterBits, Header.parse(&buf));
+}
+
+test "extended L2: per-subcluster allocation and zero bitmap" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14; // minimum allowed; 16 KiB clusters
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+    const subcluster_size = cs / Header.subclusters_per_cluster; // 512 bytes
+
+    // Layout: cluster 0 = header, 1 = L1 table, 2 = L2 table (extended),
+    // 3 = the one allocated data cluster (shared by every allocated
+    // subcluster; per-subcluster host offset = base + index*subcluster_size).
+    const file = try a.alloc(u8, 4 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const l1_offset = 1 * cs;
+    const l2_offset = 2 * cs;
+    const data_offset = 3 * cs;
+
+    writeExtL2ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = l1_offset,
+    });
+
+    const copied: u64 = @as(u64, 1) << 63;
+    std.mem.writeInt(u64, file[@intCast(l1_offset)..][0..8], l2_offset | copied, .big);
+
+    // L2 entry 0 (16 bytes): first 8 = standard descriptor (host offset,
+    // bit 0 unused for extended L2); last 8 = alloc bitmap (bits 0-31) |
+    // zero bitmap (bits 32-63). Subcluster 0 and 3 allocated, subcluster 1
+    // zero, everything else (including subcluster 2) unallocated.
+    std.mem.writeInt(u64, file[@intCast(l2_offset)..][0..8], data_offset | copied, .big);
+    const alloc_bits: u64 = (@as(u64, 1) << 0) | (@as(u64, 1) << 3);
+    const zero_bits: u64 = @as(u64, 1) << (32 + 1);
+    std.mem.writeInt(u64, file[@intCast(l2_offset + 8)..][0..8], alloc_bits | zero_bits, .big);
+
+    // Recognizable pattern in the data cluster.
+    for (file[@intCast(data_offset)..][0..cs], 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251);
+
+    const out_file = try tmp.dir.createFile(io, "ext.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "ext.qcow2");
+    defer img.close();
+
+    // mapCluster resolves per-subcluster status directly.
+    switch (try img.mapCluster(0)) {
+        .standard => |h| try std.testing.expectEqual(data_offset, h),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try img.mapCluster(1 * subcluster_size)) {
+        .zero => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try img.mapCluster(2 * subcluster_size)) {
+        .unallocated => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try img.mapCluster(3 * subcluster_size)) {
+        .standard => |h| try std.testing.expectEqual(data_offset + 3 * subcluster_size, h),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A whole-cluster read should splice together allocated / zero /
+    // unallocated (no backing file => zero) subcluster ranges correctly.
+    const got = try a.alloc(u8, cs);
+    defer a.free(got);
+    try img.read(0, got);
+
+    const expected = try a.alloc(u8, cs);
+    defer a.free(expected);
+    @memset(expected, 0);
+    for (expected[0..subcluster_size], 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251);
+    for (expected[3 * subcluster_size ..][0..subcluster_size], 0..) |*b, i| {
+        b.* = @intCast(((3 * subcluster_size + i) * 7 + 1) % 251);
+    }
+    try std.testing.expectEqualSlices(u8, expected, got);
+}
+
+test "extended L2: unallocated subclusters fall through to the backing file" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+    const subcluster_size = cs / Header.subclusters_per_cluster;
+    const vsize = cs; // single guest cluster, matching the backing image size
+
+    // Backing image: a plain (non-extended-L2) qcow2 with a known pattern.
+    const backing_data = try a.alloc(u8, vsize);
+    defer a.free(backing_data);
+    for (backing_data, 0..) |*b, i| b.* = @intCast((i * 3 + 5) % 253);
+    try writer.createFromRaw(a, io, tmp.dir, "backing.qcow2", backing_data, vsize, .{});
+
+    // Main extended-L2 image referencing it.
+    const file = try a.alloc(u8, 4 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const backing_name = "backing.qcow2";
+    const backing_name_offset: u64 = 512; // clear of the 104-byte header
+    @memcpy(file[@intCast(backing_name_offset)..][0..backing_name.len], backing_name);
+
+    const l1_offset = 1 * cs;
+    const l2_offset = 2 * cs;
+    const data_offset = 3 * cs;
+
+    writeExtL2ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = vsize,
+        .l1_size = 1,
+        .l1_table_offset = l1_offset,
+        .backing_file_offset = backing_name_offset,
+        .backing_file_size = @intCast(backing_name.len),
+    });
+
+    const copied: u64 = @as(u64, 1) << 63;
+    std.mem.writeInt(u64, file[@intCast(l1_offset)..][0..8], l2_offset | copied, .big);
+
+    // Only subcluster 0 (allocated) and subcluster 1 (zero) override the
+    // backing file; every other subcluster is unallocated and must read
+    // from the backing image.
+    std.mem.writeInt(u64, file[@intCast(l2_offset)..][0..8], data_offset | copied, .big);
+    const alloc_bits: u64 = @as(u64, 1) << 0;
+    const zero_bits: u64 = @as(u64, 1) << (32 + 1);
+    std.mem.writeInt(u64, file[@intCast(l2_offset + 8)..][0..8], alloc_bits | zero_bits, .big);
+
+    for (file[@intCast(data_offset)..][0..cs], 0..) |*b, i| b.* = @intCast((i * 11 + 2) % 241);
+
+    const out_file = try tmp.dir.createFile(io, "main.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "main.qcow2");
+    defer img.close();
+    try std.testing.expect(img.backing != null);
+
+    const got = try a.alloc(u8, vsize);
+    defer a.free(got);
+    try img.read(0, got);
+
+    const expected = try a.alloc(u8, vsize);
+    defer a.free(expected);
+    @memcpy(expected, backing_data); // default: everything comes from backing
+    for (expected[0..subcluster_size], 0..) |*b, i| b.* = @intCast((i * 11 + 2) % 241);
+    @memset(expected[subcluster_size .. 2 * subcluster_size], 0);
+    try std.testing.expectEqualSlices(u8, expected, got);
+}
+
+test "extended L2: compressed cluster descriptor is unaffected by subclusters" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const file = try a.alloc(u8, 3 * cs); // header, L1, L2 (no data cluster needed)
+    defer a.free(file);
+    @memset(file, 0);
+
+    const l1_offset = 1 * cs;
+    const l2_offset = 2 * cs;
+
+    writeExtL2ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = l1_offset,
+    });
+
+    const copied: u64 = @as(u64, 1) << 63;
+    std.mem.writeInt(u64, file[@intCast(l1_offset)..][0..8], l2_offset | copied, .big);
+
+    // Compressed cluster descriptor (bit 62 set); the trailing subcluster
+    // bitmap word is reserved/unused for compressed clusters and must be
+    // ignored, so fill it with garbage to make sure it isn't consulted.
+    const csize_shift: u6 = 62 - (cluster_bits - 8);
+    const coffset: u64 = 5000;
+    const nb_extra_sectors: u64 = 2;
+    const compressed_bit: u64 = @as(u64, 1) << 62;
+    const first8 = compressed_bit | (nb_extra_sectors << csize_shift) | coffset;
+    std.mem.writeInt(u64, file[@intCast(l2_offset)..][0..8], first8, .big);
+    std.mem.writeInt(u64, file[@intCast(l2_offset + 8)..][0..8], 0xffffffffffffffff, .big);
+
+    const out_file = try tmp.dir.createFile(io, "comp.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "comp.qcow2");
+    defer img.close();
+
+    switch (try img.mapCluster(0)) {
+        .compressed => |ref| {
+            try std.testing.expectEqual(@as(u64, 5000), ref.coffset);
+            const expected_csize = (nb_extra_sectors + 1) * 512 - (coffset % 512);
+            try std.testing.expectEqual(@as(u32, @intCast(expected_csize)), ref.csize);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
