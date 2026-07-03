@@ -13,7 +13,7 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 - [x] `read(guest_offset, buf)` for uncompressed images
 - [x] Compressed clusters (deflate / zstd)
 - [x] `info` / `map` / `read` CLI
-- [ ] Backing-file chains
+- [x] Backing-file chains
 - [ ] Extended L2 (subcluster) entries
 - [ ] Writer / image creation
 
