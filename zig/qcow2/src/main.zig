@@ -1,10 +1,12 @@
 //! qcow2 CLI — a small demo/validation tool over the native Zig qcow2 reader.
 //!
-//!   qcow2 info  <image>                 dump header + feature summary
-//!   qcow2 map   <image> <offset>        classify the cluster at a guest offset
-//!   qcow2 read  <image> <offset> <len>  write `len` bytes from the guest disk
-//!                                        to stdout (raw)
-//!   qcow2 check <image>                 basic refcount/consistency check
+//!   qcow2 info      <image>                 dump header + feature summary
+//!   qcow2 map       <image> <offset>        classify the cluster at a guest offset
+//!   qcow2 read      <image> <offset> <len> [--snapshot=<id>]
+//!                                            write `len` bytes from the guest disk
+//!                                            (or a snapshot's) to stdout (raw)
+//!   qcow2 check     <image>                 basic refcount/consistency check
+//!   qcow2 snapshots <image>                 list the snapshot directory
 
 const std = @import("std");
 const Io = std.Io;
@@ -50,13 +52,19 @@ pub fn main(init: std.process.Init) !void {
         const off = try std.fmt.parseInt(u64, args[3], 0);
         const len = try std.fmt.parseInt(usize, args[4], 0);
         const buf = try arena.alloc(u8, len);
-        try img.read(off, buf);
+        if (args.len >= 6 and std.mem.startsWith(u8, args[5], "--snapshot=")) {
+            try readSnapshotCmd(arena, &img, args[5]["--snapshot=".len..], off, buf);
+        } else {
+            try img.read(off, buf);
+        }
         try out.writeAll(buf);
     } else if (std.mem.eql(u8, cmd, "check")) {
         const clean = try checkCmd(out, arena, &img);
         try out.flush();
         if (!clean) return error.ChecksFailed;
         return;
+    } else if (std.mem.eql(u8, cmd, "snapshots")) {
+        try snapshotsCmd(out, arena, &img);
     } else {
         try usage(out);
         try out.flush();
@@ -82,8 +90,9 @@ fn usage(out: *Io.Writer) !void {
         \\usage:
         \\  qcow2 info <image>
         \\  qcow2 map  <image> <offset>
-        \\  qcow2 read <image> <offset> <len>   (raw bytes to stdout)
+        \\  qcow2 read <image> <offset> <len> [--snapshot=<id>]  (raw bytes to stdout)
         \\  qcow2 check <image>                 (basic refcount/consistency check)
+        \\  qcow2 snapshots <image>              (list the snapshot directory)
         \\  qcow2 convert <raw_in> <qcow2_out>  (create qcow2 from a raw file)
         \\
     );
@@ -156,4 +165,40 @@ fn checkCmd(out: *Io.Writer, allocator: std.mem.Allocator, img: *qcow2.Image) !b
     }
     try out.print("{d} errors were found on the image.\n", .{report.findings.items.len});
     return false;
+}
+
+/// `read ... --snapshot=<id>`: find the snapshot whose id or name matches
+/// `id_or_name` and read from it instead of the active image.
+fn readSnapshotCmd(
+    allocator: std.mem.Allocator,
+    img: *qcow2.Image,
+    id_or_name: []const u8,
+    off: u64,
+    buf: []u8,
+) !void {
+    const snaps = try img.snapshots(allocator);
+    for (snaps) |s| {
+        if (std.mem.eql(u8, s.id, id_or_name) or std.mem.eql(u8, s.name, id_or_name)) {
+            var view = try img.openSnapshot(allocator, s);
+            defer view.deinit();
+            try view.read(off, buf);
+            return;
+        }
+    }
+    return error.SnapshotNotFound;
+}
+
+/// `snapshots <image>`: list the snapshot directory.
+fn snapshotsCmd(out: *Io.Writer, allocator: std.mem.Allocator, img: *qcow2.Image) !void {
+    const snaps = try img.snapshots(allocator);
+    if (snaps.len == 0) {
+        try out.writeAll("(no snapshots)\n");
+        return;
+    }
+    for (snaps) |s| {
+        try out.print(
+            "id={s}  name={s}  size={d} bytes  date={d}.{d:0>9}\n",
+            .{ s.id, s.name, s.disk_size, s.date_sec, s.date_nsec },
+        );
+    }
 }

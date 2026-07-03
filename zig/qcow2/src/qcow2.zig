@@ -5,8 +5,10 @@
 //!
 //! Scope: read path for v2/v3 images, including standard, zero, unallocated,
 //! and compressed clusters, backing-file chains, and Extended L2 Entries
-//! (per-subcluster allocation), plus refcount lookups and a basic
-//! consistency check (`Image.check`). See `writer.zig` for image creation.
+//! (per-subcluster allocation), refcount lookups and a basic consistency
+//! check (`Image.check`), and read-only access to internal snapshots
+//! (`Image.snapshots` / `Image.openSnapshot`). See `writer.zig` for image
+//! creation.
 //!
 //! All multi-byte integers in qcow2 are stored big-endian.
 
@@ -209,6 +211,42 @@ pub const CheckReport = struct {
     }
 };
 
+/// A single entry in the qcow2 snapshot directory (see `Image.snapshots`).
+/// `id` and `name` are owned; free with `deinit` (or `freeSnapshots` for a
+/// whole slice returned by `Image.snapshots`).
+pub const Snapshot = struct {
+    id: []u8,
+    name: []u8,
+    l1_table_offset: u64,
+    l1_size: u32,
+    date_sec: u32,
+    date_nsec: u32,
+    vm_clock_nsec: u64,
+    /// Size of the saved VM state, in bytes (0 if none was saved). Prefers
+    /// the 64-bit extra-data field when present, falling back to the
+    /// original 32-bit field otherwise.
+    vm_state_size: u64,
+    /// Virtual disk size of the snapshot, in bytes. 0 if the image doesn't
+    /// carry this (v3) extra-data field.
+    disk_size: u64 = 0,
+    /// Record/replay instruction count, or `no_icount` if disabled/absent.
+    icount: u64 = no_icount,
+
+    pub const no_icount: u64 = std.math.maxInt(u64); // spec: "-1 if disabled"
+
+    pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+    }
+};
+
+/// Free a slice of `Snapshot` returned by `Image.snapshots`, including each
+/// entry's owned `id`/`name` strings.
+pub fn freeSnapshots(allocator: std.mem.Allocator, snaps: []Snapshot) void {
+    for (snaps) |*s| s.deinit(allocator);
+    allocator.free(snaps);
+}
+
 const l2e_offset_mask: u64 = 0x00fffffffffffe00; // bits 9..55
 const l2e_compressed: u64 = @as(u64, 1) << 62;
 const l1e_offset_mask: u64 = 0x00fffffffffffe00;
@@ -313,7 +351,19 @@ pub const Image = struct {
     /// offset); compressed clusters have no subclusters and are always
     /// resolved at full cluster granularity.
     pub fn mapCluster(self: *Image, guest_offset: u64) !Mapping {
-        if (guest_offset >= self.header.size) return error.OutOfRange;
+        return self.mapClusterIn(self.l1, self.header.size, guest_offset);
+    }
+
+    /// Core of `mapCluster`, parametrized on an explicit L1 table + virtual
+    /// disk size instead of always using `self.l1`/`self.header.size`. This
+    /// lets `SnapshotView` (see `openSnapshot`) share the exact same
+    /// cluster-mapping logic against a snapshot's L1 table: the reader never
+    /// consults L1/L2 entry bit 63 (the "refcount==1" hint, which the spec
+    /// says is only accurate in the *active* L1 table) -- only the offset
+    /// and zero/compressed/allocation bits -- so no bit-63 reconstruction is
+    /// needed for read-only access.
+    fn mapClusterIn(self: *Image, l1: []const u64, size: u64, guest_offset: u64) !Mapping {
+        if (guest_offset >= size) return error.OutOfRange;
 
         const cs = self.header.clusterSize();
         const l2_entries = self.header.l2Entries();
@@ -321,8 +371,8 @@ pub const Image = struct {
         const l2_index = cluster_index % l2_entries;
         const l1_index = cluster_index / l2_entries;
 
-        if (l1_index >= self.l1.len) return error.OutOfRange;
-        const l1_entry = self.l1[l1_index];
+        if (l1_index >= l1.len) return error.OutOfRange;
+        const l1_entry = l1[l1_index];
         const l2_offset = l1_entry & l1e_offset_mask;
         if (l2_offset == 0) return .unallocated;
 
@@ -444,8 +494,80 @@ pub const Image = struct {
         if (!exact) gop.value_ptr.exact = false;
     }
 
+    /// Walk one L1 table (active or a snapshot's) and mark every L2 table
+    /// cluster and data/compressed cluster it reaches. Shared by `check`
+    /// for both the active image and each entry from `snapshots`.
+    fn markL1Table(
+        self: *Image,
+        allocator: std.mem.Allocator,
+        computed: *std.AutoHashMap(u64, ClusterRef),
+        l1: []const u64,
+    ) !void {
+        const cs = self.header.clusterSize();
+        const entry_size = self.header.l2EntrySize();
+        const l2_entries = self.header.l2Entries();
+        const l2_buf = try allocator.alloc(u8, cs);
+        defer allocator.free(l2_buf);
+
+        for (l1) |l1_entry| {
+            const l2_offset = l1_entry & l1e_offset_mask;
+            if (l2_offset == 0) continue;
+            try markCluster(computed, l2_offset / cs, true);
+
+            const got = try self.file.readPositionalAll(self.io, l2_buf, l2_offset);
+            if (got != l2_buf.len) return error.Truncated;
+
+            var idx: u64 = 0;
+            while (idx < l2_entries) : (idx += 1) {
+                const at = idx * entry_size;
+                const l2_entry = std.mem.readInt(u64, l2_buf[at..][0..8], .big);
+
+                if ((l2_entry & l2e_compressed) != 0) {
+                    const csize_shift: u6 = @intCast(62 - (self.header.cluster_bits - 8));
+                    const csize_mask: u64 = (@as(u64, 1) << @intCast(self.header.cluster_bits - 8)) - 1;
+                    const offset_mask: u64 = (@as(u64, 1) << csize_shift) - 1;
+                    const coffset = l2_entry & offset_mask;
+                    const nb_csectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+                    const sector_size: u64 = 512;
+                    const csize = nb_csectors * sector_size - (coffset & (sector_size - 1));
+                    if (csize != 0) {
+                        const first_cluster = coffset / cs;
+                        const last_cluster = (coffset + csize - 1) / cs;
+                        var cc = first_cluster;
+                        while (cc <= last_cluster) : (cc += 1) try markCluster(computed, cc, false);
+                    }
+                    continue;
+                }
+
+                const host_offset = l2_entry & l2e_offset_mask;
+                if (host_offset != 0) try markCluster(computed, host_offset / cs, true);
+            }
+        }
+    }
+
+    /// Byte offset immediately after the last snapshot table entry (the end
+    /// of the variable-length snapshot directory), without allocating the
+    /// id/name strings `snapshots` does. Used by `check` to mark the
+    /// directory's own cluster(s).
+    fn snapshotDirectoryEnd(self: *Image) !u64 {
+        var pos: u64 = self.header.snapshots_offset;
+        var i: u32 = 0;
+        while (i < self.header.nb_snapshots) : (i += 1) {
+            var fixed: [40]u8 = undefined;
+            const got = try self.file.readPositionalAll(self.io, &fixed, pos);
+            if (got != fixed.len) return error.Truncated;
+            const id_len = std.mem.readInt(u16, fixed[12..14], .big);
+            const name_len = std.mem.readInt(u16, fixed[14..16], .big);
+            const extra_data_size = std.mem.readInt(u32, fixed[36..40], .big);
+            const entry_size = 40 + @as(u64, extra_data_size) + id_len + name_len;
+            pos += std.mem.alignForward(u64, entry_size, 8);
+        }
+        return pos;
+    }
+
     /// Walk this image's own metadata (header, L1/L2 tables, data clusters,
-    /// refcount table/blocks) and cross-check it against stored refcounts:
+    /// refcount table/blocks, and the snapshot directory + each snapshot's
+    /// own L1/L2/data clusters) and cross-check it against stored refcounts:
     /// every referenced cluster must have a nonzero stored refcount and
     /// (except for compressed-cluster hosts, see `ClusterRef`) match the
     /// number of times it was referenced; every cluster in the file with a
@@ -453,10 +575,9 @@ pub const Image = struct {
     /// (otherwise it's reported as leaked).
     ///
     /// This intentionally does not recurse into a backing image (matching
-    /// `qemu-img check`, which checks one image at a time) and does not
-    /// walk snapshot L1 tables (snapshots are not yet implemented -- see
-    /// issue #10). It also isn't optimized for huge images: the leaked-
-    /// cluster pass calls `refcountAt` once per cluster in the file.
+    /// `qemu-img check`, which checks one image at a time). It also isn't
+    /// optimized for huge images: the leaked-cluster pass calls
+    /// `refcountAt` once per cluster in the file.
     pub fn check(self: *Image, allocator: std.mem.Allocator) !CheckReport {
         var computed = std.AutoHashMap(u64, ClusterRef).init(allocator);
         defer computed.deinit();
@@ -491,43 +612,35 @@ pub const Image = struct {
             }
         }
 
-        const entry_size = self.header.l2EntrySize();
-        const l2_entries = self.header.l2Entries();
-        const l2_buf = try allocator.alloc(u8, cs);
-        defer allocator.free(l2_buf);
+        try self.markL1Table(allocator, &computed, self.l1);
 
-        for (self.l1) |l1_entry| {
-            const l2_offset = l1_entry & l1e_offset_mask;
-            if (l2_offset == 0) continue;
-            try markCluster(&computed, l2_offset / cs, true);
+        // Snapshot directory: its own cluster(s), plus each snapshot's own
+        // L1 table cluster(s) and everything reachable from it.
+        if (self.header.nb_snapshots != 0) {
+            const dir_end = try self.snapshotDirectoryEnd();
+            var dc = self.header.snapshots_offset / cs;
+            const dir_end_cluster = (dir_end - 1) / cs;
+            while (dc <= dir_end_cluster) : (dc += 1) try markCluster(&computed, dc, true);
 
-            const got = try self.file.readPositionalAll(self.io, l2_buf, l2_offset);
-            if (got != l2_buf.len) return error.Truncated;
+            const snaps = try self.snapshots(allocator);
+            defer freeSnapshots(allocator, snaps);
 
-            var idx: u64 = 0;
-            while (idx < l2_entries) : (idx += 1) {
-                const at = idx * entry_size;
-                const l2_entry = std.mem.readInt(u64, l2_buf[at..][0..8], .big);
+            for (snaps) |snap| {
+                if (snap.l1_size == 0) continue;
+                const l1_bytes = @as(u64, snap.l1_size) * @sizeOf(u64);
+                const l1_clusters = (l1_bytes + cs - 1) / cs;
+                const l1_start = snap.l1_table_offset / cs;
+                var i: u64 = 0;
+                while (i < l1_clusters) : (i += 1) try markCluster(&computed, l1_start + i, true);
 
-                if ((l2_entry & l2e_compressed) != 0) {
-                    const csize_shift: u6 = @intCast(62 - (self.header.cluster_bits - 8));
-                    const csize_mask: u64 = (@as(u64, 1) << @intCast(self.header.cluster_bits - 8)) - 1;
-                    const offset_mask: u64 = (@as(u64, 1) << csize_shift) - 1;
-                    const coffset = l2_entry & offset_mask;
-                    const nb_csectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-                    const sector_size: u64 = 512;
-                    const csize = nb_csectors * sector_size - (coffset & (sector_size - 1));
-                    if (csize != 0) {
-                        const first_cluster = coffset / cs;
-                        const last_cluster = (coffset + csize - 1) / cs;
-                        var cc = first_cluster;
-                        while (cc <= last_cluster) : (cc += 1) try markCluster(&computed, cc, false);
-                    }
-                    continue;
-                }
+                const snap_l1 = try allocator.alloc(u64, snap.l1_size);
+                defer allocator.free(snap_l1);
+                const bytes = std.mem.sliceAsBytes(snap_l1);
+                const got = try self.file.readPositionalAll(self.io, bytes, snap.l1_table_offset);
+                if (got != bytes.len) return error.Truncated;
+                for (snap_l1) |*e| e.* = std.mem.bigToNative(u64, e.*);
 
-                const host_offset = l2_entry & l2e_offset_mask;
-                if (host_offset != 0) try markCluster(&computed, host_offset / cs, true);
+                try self.markL1Table(allocator, &computed, snap_l1);
             }
         }
 
@@ -597,6 +710,104 @@ pub const Image = struct {
         return report;
     }
 
+    /// Parse the snapshot directory (`header.nb_snapshots` variable-length
+    /// entries starting at `header.snapshots_offset`). Returns an owned
+    /// slice; free it with `freeSnapshots`.
+    pub fn snapshots(self: *Image, allocator: std.mem.Allocator) ![]Snapshot {
+        var list: std.ArrayList(Snapshot) = .empty;
+        errdefer {
+            for (list.items) |*s| s.deinit(allocator);
+            list.deinit(allocator);
+        }
+
+        var pos: u64 = self.header.snapshots_offset;
+        var i: u32 = 0;
+        while (i < self.header.nb_snapshots) : (i += 1) {
+            var fixed: [40]u8 = undefined;
+            const got = try self.file.readPositionalAll(self.io, &fixed, pos);
+            if (got != fixed.len) return error.Truncated;
+
+            const l1_table_offset = std.mem.readInt(u64, fixed[0..8], .big);
+            const l1_size = std.mem.readInt(u32, fixed[8..12], .big);
+            const id_len = std.mem.readInt(u16, fixed[12..14], .big);
+            const name_len = std.mem.readInt(u16, fixed[14..16], .big);
+            const date_sec = std.mem.readInt(u32, fixed[16..20], .big);
+            const date_nsec = std.mem.readInt(u32, fixed[20..24], .big);
+            const vm_clock_nsec = std.mem.readInt(u64, fixed[24..32], .big);
+            const vm_state_size32 = std.mem.readInt(u32, fixed[32..36], .big);
+            const extra_data_size = std.mem.readInt(u32, fixed[36..40], .big);
+
+            var vm_state_size: u64 = vm_state_size32;
+            var disk_size: u64 = 0;
+            var icount: u64 = Snapshot.no_icount;
+            if (extra_data_size > 0) {
+                const extra = try allocator.alloc(u8, extra_data_size);
+                defer allocator.free(extra);
+                const got_extra = try self.file.readPositionalAll(self.io, extra, pos + 40);
+                if (got_extra != extra.len) return error.Truncated;
+                // Per spec: unknown/absent extra fields are ignored, not errors.
+                if (extra.len >= 8) vm_state_size = std.mem.readInt(u64, extra[0..8], .big);
+                if (extra.len >= 16) disk_size = std.mem.readInt(u64, extra[8..16], .big);
+                if (extra.len >= 24) icount = std.mem.readInt(u64, extra[16..24], .big);
+            }
+
+            const id_offset = pos + 40 + extra_data_size;
+            const id = try allocator.alloc(u8, id_len);
+            errdefer allocator.free(id);
+            const got_id = try self.file.readPositionalAll(self.io, id, id_offset);
+            if (got_id != id.len) return error.Truncated;
+
+            const name_offset = id_offset + id_len;
+            const name = try allocator.alloc(u8, name_len);
+            errdefer allocator.free(name);
+            const got_name = try self.file.readPositionalAll(self.io, name, name_offset);
+            if (got_name != name.len) return error.Truncated;
+
+            try list.append(allocator, .{
+                .id = id,
+                .name = name,
+                .l1_table_offset = l1_table_offset,
+                .l1_size = l1_size,
+                .date_sec = date_sec,
+                .date_nsec = date_nsec,
+                .vm_clock_nsec = vm_clock_nsec,
+                .vm_state_size = vm_state_size,
+                .disk_size = disk_size,
+                .icount = icount,
+            });
+
+            const entry_size = 40 + @as(u64, extra_data_size) + id_len + name_len;
+            pos += std.mem.alignForward(u64, entry_size, 8);
+        }
+
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Open a read-only view of `snap`'s virtual disk contents (as obtained
+    /// from `snapshots`): loads the snapshot's own L1 table and reuses the
+    /// same `mapClusterIn`/`readIn` core the active image uses. Free with
+    /// `SnapshotView.deinit`.
+    ///
+    /// If the snapshot doesn't carry a disk-size extra field (pre-v3-style
+    /// snapshots, or a very old writer), falls back to the active image's
+    /// current virtual size.
+    pub fn openSnapshot(self: *Image, allocator: std.mem.Allocator, snap: Snapshot) !SnapshotView {
+        const l1 = try allocator.alloc(u64, snap.l1_size);
+        errdefer allocator.free(l1);
+        if (snap.l1_size != 0) {
+            const bytes = std.mem.sliceAsBytes(l1);
+            const got = try self.file.readPositionalAll(self.io, bytes, snap.l1_table_offset);
+            if (got != bytes.len) return error.Truncated;
+            for (l1) |*e| e.* = std.mem.bigToNative(u64, e.*);
+        }
+        return .{
+            .image = self,
+            .l1 = l1,
+            .size = if (snap.disk_size != 0) snap.disk_size else self.header.size,
+            .allocator = allocator,
+        };
+    }
+
     /// Decompress the single guest cluster described by `ref` into `dst`,
     /// which must be exactly one cluster in size. Any tail not produced by the
     /// decompressor is zero-filled.
@@ -642,15 +853,21 @@ pub const Image = struct {
     /// followed). Compressed clusters are decoded in-place. For Extended L2
     /// images, standard/zero/unallocated status is resolved per-subcluster.
     pub fn read(self: *Image, guest_offset: u64, buf: []u8) !void {
+        return self.readIn(self.l1, self.header.size, guest_offset, buf);
+    }
+
+    /// Core of `read`, parametrized on an explicit L1 table + virtual disk
+    /// size (see `mapClusterIn`).
+    fn readIn(self: *Image, l1: []const u64, size: u64, guest_offset: u64, buf: []u8) !void {
         const cs = self.header.clusterSize();
         const ext_l2 = self.header.hasIncompatible(.extended_l2);
         const subcluster_size = if (ext_l2) self.header.subclusterSize() else cs;
         var pos: u64 = guest_offset;
         var written: usize = 0;
         while (written < buf.len) {
-            if (pos >= self.header.size) return error.OutOfRange;
+            if (pos >= size) return error.OutOfRange;
             const in_cluster = pos % cs;
-            const mapping = try self.mapCluster(pos);
+            const mapping = try self.mapClusterIn(l1, size, pos);
 
             // Compressed clusters have no subclusters, so they're always
             // resolved (and chunked) at full cluster granularity; everything
@@ -701,6 +918,30 @@ pub const Image = struct {
         const from_backing: usize = @intCast(@min(@as(u64, dst.len), avail));
         try backing.read(pos, dst[0..from_backing]);
         if (from_backing < dst.len) @memset(dst[from_backing..], 0);
+    }
+};
+
+/// A read-only view of a qcow2 snapshot's virtual disk, opened via
+/// `Image.openSnapshot`. Shares the parent `Image`'s file handle and header
+/// (cluster size, Extended L2/compression settings are image-wide), but maps
+/// guest offsets through the snapshot's own L1 table and disk size.
+pub const SnapshotView = struct {
+    image: *Image,
+    l1: []u64,
+    size: u64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *SnapshotView) void {
+        self.allocator.free(self.l1);
+        self.* = undefined;
+    }
+
+    pub fn mapCluster(self: *SnapshotView, guest_offset: u64) !Mapping {
+        return self.image.mapClusterIn(self.l1, self.size, guest_offset);
+    }
+
+    pub fn read(self: *SnapshotView, guest_offset: u64, buf: []u8) !void {
+        return self.image.readIn(self.l1, self.size, guest_offset, buf);
     }
 };
 
@@ -763,6 +1004,8 @@ const V3HeaderOpts = struct {
     refcount_order: u32 = 4,
     backing_file_offset: u64 = 0,
     backing_file_size: u32 = 0,
+    nb_snapshots: u32 = 0,
+    snapshots_offset: u64 = 0,
 };
 fn writeV3ImageHeader(buf: []u8, opts: V3HeaderOpts) void {
     @memset(buf[0..104], 0);
@@ -775,6 +1018,8 @@ fn writeV3ImageHeader(buf: []u8, opts: V3HeaderOpts) void {
     std.mem.writeInt(u32, buf[36..40], opts.l1_size, .big);
     std.mem.writeInt(u64, buf[40..48], opts.l1_table_offset, .big);
     std.mem.writeInt(u64, buf[48..56], opts.refcount_table_offset, .big);
+    std.mem.writeInt(u32, buf[60..64], opts.nb_snapshots, .big);
+    std.mem.writeInt(u64, buf[64..72], opts.snapshots_offset, .big);
     std.mem.writeInt(u32, buf[96..100], opts.refcount_order, .big);
     std.mem.writeInt(u32, buf[100..104], 104, .big); // header_length
 }
@@ -1512,5 +1757,251 @@ test "check(): a backing-file name inside the header cluster isn't double-counte
     try std.testing.expect(report.isClean());
 }
 
+test "snapshots(): parses id/name/timestamps/extra data" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+    const snap_offset = 1 * cs;
+
+    const id = "snap1";
+    const name = "my snapshot";
+    const extra_data_size: u32 = 24; // vm_state_size(64) + disk_size + icount
+
+    const file = try a.alloc(u8, 2 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .nb_snapshots = 1,
+        .snapshots_offset = snap_offset,
+    });
+
+    const e = file[@intCast(snap_offset)..];
+    std.mem.writeInt(u64, e[0..8], 2 * cs, .big); // l1_table_offset
+    std.mem.writeInt(u32, e[8..12], 5, .big); // l1_size
+    std.mem.writeInt(u16, e[12..14], @intCast(id.len), .big);
+    std.mem.writeInt(u16, e[14..16], @intCast(name.len), .big);
+    std.mem.writeInt(u32, e[16..20], 1000, .big); // date_sec
+    std.mem.writeInt(u32, e[20..24], 2000, .big); // date_nsec
+    std.mem.writeInt(u64, e[24..32], 123456789, .big); // vm_clock_nsec
+    std.mem.writeInt(u32, e[32..36], 0, .big); // vm_state_size (32-bit, superseded below)
+    std.mem.writeInt(u32, e[36..40], extra_data_size, .big);
+    std.mem.writeInt(u64, e[40..48], 999, .big); // vm_state_size (64-bit)
+    std.mem.writeInt(u64, e[48..56], 2 * 1024 * 1024, .big); // disk_size
+    std.mem.writeInt(u64, e[56..64], 42, .big); // icount
+    @memcpy(e[64..][0..id.len], id);
+    @memcpy(e[64 + id.len ..][0..name.len], name);
+
+    const out_file = try tmp.dir.createFile(io, "snap.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "snap.qcow2");
+    defer img.close();
+
+    const snaps = try img.snapshots(a);
+    defer freeSnapshots(a, snaps);
+
+    try std.testing.expectEqual(@as(usize, 1), snaps.len);
+    const s = snaps[0];
+    try std.testing.expectEqualStrings("snap1", s.id);
+    try std.testing.expectEqualStrings("my snapshot", s.name);
+    try std.testing.expectEqual(@as(u64, 2 * cs), s.l1_table_offset);
+    try std.testing.expectEqual(@as(u32, 5), s.l1_size);
+    try std.testing.expectEqual(@as(u32, 1000), s.date_sec);
+    try std.testing.expectEqual(@as(u32, 2000), s.date_nsec);
+    try std.testing.expectEqual(@as(u64, 123456789), s.vm_clock_nsec);
+    try std.testing.expectEqual(@as(u64, 999), s.vm_state_size);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), s.disk_size);
+    try std.testing.expectEqual(@as(u64, 42), s.icount);
+}
+
+test "snapshots(): no snapshots returns an empty slice" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [104]u8 = @splat(0);
+    writeV3ImageHeader(&buf, .{ .cluster_bits = 16, .size = 65536 });
+
+    const out_file = try tmp.dir.createFile(io, "nosnap.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, &buf, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "nosnap.qcow2");
+    defer img.close();
+
+    const snaps = try img.snapshots(a);
+    defer freeSnapshots(a, snaps);
+    try std.testing.expectEqual(@as(usize, 0), snaps.len);
+}
 
 
+
+
+
+test "openSnapshot(): reads distinct data from active vs. snapshot L1 tables" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const active_l1_offset = 1 * cs;
+    const active_l2_offset = 2 * cs;
+    const active_data_offset = 3 * cs;
+    const snap_l1_offset = 4 * cs;
+    const snap_l2_offset = 5 * cs;
+    const snap_data_offset = 6 * cs;
+    const snap_table_offset = 7 * cs;
+
+    const file = try a.alloc(u8, 8 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = active_l1_offset,
+        .nb_snapshots = 1,
+        .snapshots_offset = snap_table_offset,
+    });
+
+    std.mem.writeInt(u64, file[@intCast(active_l1_offset)..][0..8], active_l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(active_l2_offset)..][0..8], active_data_offset, .big);
+    for (file[@intCast(active_data_offset)..][0..cs], 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251); // pattern A
+
+    std.mem.writeInt(u64, file[@intCast(snap_l1_offset)..][0..8], snap_l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(snap_l2_offset)..][0..8], snap_data_offset, .big);
+    for (file[@intCast(snap_data_offset)..][0..cs], 0..) |*b, i| b.* = @intCast((i * 13 + 3) % 241); // pattern B
+
+    // Snapshot table entry.
+    const id = "snap0";
+    const e = file[@intCast(snap_table_offset)..];
+    std.mem.writeInt(u64, e[0..8], snap_l1_offset, .big);
+    std.mem.writeInt(u32, e[8..12], 1, .big); // l1_size
+    std.mem.writeInt(u16, e[12..14], @intCast(id.len), .big);
+    std.mem.writeInt(u16, e[14..16], 0, .big); // name_len
+    std.mem.writeInt(u32, e[36..40], 16, .big); // extra_data_size (vm_state64 + disk_size)
+    std.mem.writeInt(u64, e[40..48], 0, .big); // vm_state_size
+    std.mem.writeInt(u64, e[48..56], cs, .big); // disk_size
+    @memcpy(e[56..][0..id.len], id);
+
+    const out_file = try tmp.dir.createFile(io, "snaprd.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "snaprd.qcow2");
+    defer img.close();
+
+    const snaps = try img.snapshots(a);
+    defer freeSnapshots(a, snaps);
+    try std.testing.expectEqual(@as(usize, 1), snaps.len);
+
+    var view = try img.openSnapshot(a, snaps[0]);
+    defer view.deinit();
+
+    var active_out: [16384]u8 = undefined;
+    try img.read(0, &active_out);
+    var snap_out: [16384]u8 = undefined;
+    try view.read(0, &snap_out);
+
+    var expected_active: [16384]u8 = undefined;
+    for (&expected_active, 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251);
+    var expected_snap: [16384]u8 = undefined;
+    for (&expected_snap, 0..) |*b, i| b.* = @intCast((i * 13 + 3) % 241);
+
+    try std.testing.expectEqualSlices(u8, &expected_active, &active_out);
+    try std.testing.expectEqualSlices(u8, &expected_snap, &snap_out);
+    // Sanity: the two are genuinely different.
+    try std.testing.expect(!std.mem.eql(u8, &active_out, &snap_out));
+}
+
+test "check(): clean image with a snapshot (walks snapshot L1/L2/data + directory)" {
+    // Regression test: check() used to only walk the active L1 table, so
+    // any image with a snapshot reported the snapshot's L1/L2/data clusters
+    // (and the snapshot directory itself) as spuriously "leaked".
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const active_l1_offset = 1 * cs;
+    const active_l2_offset = 2 * cs;
+    const active_data_offset = 3 * cs;
+    const snap_l1_offset = 4 * cs;
+    const snap_l2_offset = 5 * cs;
+    const snap_data_offset = 6 * cs;
+    const snap_table_offset = 7 * cs;
+    const rt_offset = 8 * cs;
+    const rb_offset = 9 * cs;
+    const total_clusters = 10;
+
+    const file = try a.alloc(u8, total_clusters * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = active_l1_offset,
+        .refcount_table_offset = rt_offset,
+        .refcount_order = 4,
+        .nb_snapshots = 1,
+        .snapshots_offset = snap_table_offset,
+    });
+    std.mem.writeInt(u32, file[56..60], 1, .big); // refcount_table_clusters
+
+    std.mem.writeInt(u64, file[@intCast(active_l1_offset)..][0..8], active_l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(active_l2_offset)..][0..8], active_data_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(snap_l1_offset)..][0..8], snap_l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(snap_l2_offset)..][0..8], snap_data_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(rt_offset)..][0..8], rb_offset, .big);
+
+    // Snapshot table entry: id="s", no name, no extra data (32-bit
+    // vm_state_size only -- exercises the pre-v3-extra-data fallback path).
+    const id = "s";
+    const e = file[@intCast(snap_table_offset)..];
+    std.mem.writeInt(u64, e[0..8], snap_l1_offset, .big);
+    std.mem.writeInt(u32, e[8..12], 1, .big); // l1_size
+    std.mem.writeInt(u16, e[12..14], @intCast(id.len), .big);
+    std.mem.writeInt(u16, e[14..16], 0, .big); // name_len
+    std.mem.writeInt(u32, e[36..40], 0, .big); // extra_data_size
+    @memcpy(e[40..][0..id.len], id);
+
+    // Every cluster in the file (0-9) has a correct refcount of 1.
+    var idx: u64 = 0;
+    while (idx < total_clusters) : (idx += 1) {
+        std.mem.writeInt(u16, file[@intCast(rb_offset + idx * 2)..][0..2], 1, .big);
+    }
+
+    const out_file = try tmp.dir.createFile(io, "check-snap.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "check-snap.qcow2");
+    defer img.close();
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(report.isClean());
+    try std.testing.expectEqual(@as(u64, total_clusters), report.allocated_clusters);
+}
