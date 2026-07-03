@@ -2,10 +2,12 @@
 #
 # Cross-validate the native Zig qcow2 reader against a real qemu-img/qemu-io
 # build. Creates a handful of qcow2 images (including Extended L2 images with
-# mixed allocated/zero/unallocated subclusters, and an Extended L2 image with
-# a backing-file chain) using the real tools, then:
+# mixed allocated/zero/unallocated subclusters, an Extended L2 image with a
+# backing-file chain, and an image with an internal snapshot) using the real
+# tools, then:
 #   - compares `qcow2 read` output byte-for-byte (via cmp) against
-#     `qemu-img convert -O raw` output, and
+#     `qemu-img convert -O raw` output (and, for the snapshot case, `qcow2
+#     read --snapshot=<id>` against `qemu-img convert -l <id> -O raw`), and
 #   - compares `qcow2 check`'s clean/dirty verdict against real
 #     `qemu-img check` on the same images.
 #
@@ -93,6 +95,22 @@ echo "== Extended L2 + backing-file chain =="
 check ext-l2-backing overlay.qcow2 2097152
 check_consistency backing backing.qcow2
 check_consistency ext-l2-backing overlay.qcow2
+
+echo "== Snapshots: read the active image and an internal snapshot =="
+"$QEMU_IMG" create -f qcow2 snap.qcow2 1M >/dev/null
+"$QEMU_IO" -c "write -P 0xAA 0 65536" snap.qcow2 >/dev/null
+"$QEMU_IMG" snapshot -c snap1 snap.qcow2 >/dev/null
+"$QEMU_IO" -c "write -P 0xBB 0 65536" snap.qcow2 >/dev/null
+check snap-active snap.qcow2 1048576
+check_consistency snap-active snap.qcow2
+"$QEMU_IMG" convert -l snap1 -O raw snap.qcow2 snap1.expected.raw
+"$QCOW2" read snap.qcow2 0 1048576 --snapshot=snap1 > snap1.got.raw
+if cmp -s snap1.expected.raw snap1.got.raw; then
+    echo "PASS: snap1 (snapshot read)"
+else
+    echo "FAIL: snap1 (snapshot read) -- qcow2 read --snapshot differs from qemu-img convert -l" >&2
+    fail=1
+fi
 
 if [[ "$fail" -ne 0 ]]; then
     echo "cross-validation FAILED" >&2
