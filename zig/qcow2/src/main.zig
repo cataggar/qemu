@@ -25,6 +25,14 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cmd = args[1];
+
+    // Commands that create an image (don't open an existing one first).
+    if (std.mem.eql(u8, cmd, "convert")) {
+        if (args.len < 4) return error.Usage;
+        try convertCmd(arena, io, args[2], args[3]);
+        return;
+    }
+
     const path = args[2];
 
     var img = try qcow2.Image.open(arena, io, Io.Dir.cwd(), path);
@@ -52,12 +60,24 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
+/// `convert <raw_in> <qcow2_out>`: create a qcow2 image from a raw file.
+fn convertCmd(arena: std.mem.Allocator, io: Io, raw_path: []const u8, out_path: []const u8) !void {
+    const in = try Io.Dir.cwd().openFile(io, raw_path, .{ .mode = .read_only });
+    defer in.close(io);
+    const st = try in.stat(io);
+    const data = try arena.alloc(u8, @intCast(st.size));
+    const got = try in.readPositionalAll(io, data, 0);
+    if (got != data.len) return error.Truncated;
+    try qcow2.writer.createFromRaw(arena, io, Io.Dir.cwd(), out_path, data, st.size, .{});
+}
+
 fn usage(out: *Io.Writer) !void {
     try out.writeAll(
         \\usage:
         \\  qcow2 info <image>
         \\  qcow2 map  <image> <offset>
         \\  qcow2 read <image> <offset> <len>   (raw bytes to stdout)
+        \\  qcow2 convert <raw_in> <qcow2_out>  (create qcow2 from a raw file)
         \\
     );
 }

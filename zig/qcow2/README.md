@@ -15,7 +15,7 @@ Part of the Zig-on-QEMU experiment (see issue #2). MIT licensed.
 - [x] `info` / `map` / `read` CLI
 - [x] Backing-file chains
 - [ ] Extended L2 (subcluster) entries
-- [ ] Writer / image creation
+- [x] Writer / image creation (`convert` raw → qcow2)
 
 ## Build & test
 
@@ -33,6 +33,7 @@ zig build run -- info disk.qcow2
 qcow2 info <image>                 dump header + feature summary
 qcow2 map  <image> <offset>        classify the cluster at a guest offset
 qcow2 read <image> <offset> <len>  write raw guest bytes to stdout
+qcow2 convert <raw_in> <qcow2_out> create a qcow2 image from a raw file
 ```
 
 ## Validation against qemu-img
