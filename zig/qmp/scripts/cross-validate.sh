@@ -5,7 +5,9 @@
 # the real binary, then:
 #   - connects with the Zig client and checks the server greeting parses,
 #   - runs `query-status` and asserts the guest is reported as running,
-#   - runs `quit` and asserts the QEMU process actually exits.
+#   - runs `quit` and asserts the QEMU process actually exits,
+#   - exercises `spawnAndConnect()` and the QAPI-generated typed bindings
+#     (`qapi.queryStatus` / `qapi.quit`) via the `spawn-status` CLI command.
 #
 # Usage: cross-validate.sh <qemu-build-dir> <qmp-cli>
 #   <qemu-build-dir>  directory containing the qemu-system-x86_64 binary
@@ -100,6 +102,21 @@ if kill -0 "$QEMU_PID" 2>/dev/null; then
 else
     echo "PASS: process exited after quit"
     QEMU_PID=""
+fi
+
+echo "== spawn-status: spawnAndConnect() + typed QAPI bindings =="
+if "$QMP" spawn-status "$QEMU_SYSTEM" -M isapc -display none > "$WORK/spawn-status.log" 2>&1; then
+    if grep -q 'running=true status=running' "$WORK/spawn-status.log" && grep -q 'term=.*exited = 0' "$WORK/spawn-status.log"; then
+        echo "PASS: spawn-status"
+    else
+        echo "FAIL: spawn-status output unexpected" >&2
+        cat "$WORK/spawn-status.log" >&2
+        fail=1
+    fi
+else
+    echo "FAIL: qmp spawn-status" >&2
+    cat "$WORK/spawn-status.log" >&2
+    fail=1
 fi
 
 if [[ "$fail" -ne 0 ]]; then

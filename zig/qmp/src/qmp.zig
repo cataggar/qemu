@@ -20,6 +20,12 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 
+/// Typed bindings generated from QEMU's QAPI schema (`qapi/*.json`) by
+/// `tools/qapi_codegen.zig` -- see zig/qmp/README.md for coverage and
+/// limitations. Best-effort: consumers can always fall back to
+/// `Client.execute` directly for anything not (yet) covered here.
+pub const qapi = @import("qapi_generated.zig");
+
 /// A server-reported command error: `{"error": {"class", "desc"}}`.
 pub const CommandError = struct {
     class: []const u8,
@@ -165,6 +171,18 @@ pub fn writeCommand(w: *Io.Writer, name: []const u8, args: ?std.json.Value, id: 
     try w.flush();
 }
 
+/// Converts any `std.json.Stringify`-serializable value (e.g. a plain Zig
+/// struct, as produced by the QAPI-generated typed command bindings in
+/// `qapi_generated.zig`) into a `std.json.Value`, by round-tripping it
+/// through JSON text. Used to bridge typed argument structs into
+/// `Client.execute`'s `?std.json.Value` parameter.
+pub fn valueFromAny(allocator: std.mem.Allocator, value: anytype) !std.json.Parsed(std.json.Value) {
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try std.json.Stringify.value(value, .{}, &buf.writer);
+    return std.json.parseFromSlice(std.json.Value, allocator, buf.written(), .{});
+}
+
 /// A connected QMP session: a Unix domain socket to a `qemu-system-*` (or
 /// QEMU Guest Agent) `-qmp` control socket, past the greeting +
 /// `qmp_capabilities` handshake.
@@ -191,7 +209,22 @@ pub const Client = struct {
         const addr = try net.UnixAddress.init(path);
         const stream = try addr.connect(io);
         errdefer stream.close(io);
+        return connectStream(allocator, io, stream);
+    }
 
+    /// Connect to a TCP `-qmp tcp:host:port,server=on,wait=off` control
+    /// socket at `address`, perform the greeting + `qmp_capabilities`
+    /// handshake, and return a ready-to-use client.
+    pub fn connectTcp(allocator: std.mem.Allocator, io: Io, address: net.IpAddress) !*Client {
+        const stream = try address.connect(io, .{ .mode = .stream });
+        errdefer stream.close(io);
+        return connectStream(allocator, io, stream);
+    }
+
+    /// Shared handshake logic for an already-connected `stream` (Unix or
+    /// TCP). Takes ownership of `stream` (closed by `Client.close`, or by
+    /// the caller if this function returns an error).
+    fn connectStream(allocator: std.mem.Allocator, io: Io, stream: net.Stream) !*Client {
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         self.* = .{
@@ -288,6 +321,109 @@ pub const Client = struct {
         }
     }
 };
+
+/// Options for `spawnAndConnect`.
+pub const SpawnOptions = struct {
+    /// Path to the `qemu-system-*` (or other QMP-speaking) binary to launch.
+    binary: []const u8,
+    /// Extra argv entries, inserted between `binary` and the
+    /// auto-generated `-qmp unix:<path>,server=on,wait=off`. Typically at
+    /// least `&.{"-display", "none"}` or similar.
+    extra_args: []const []const u8 = &.{},
+    /// Path for the QMP Unix domain control socket. If null, a path under
+    /// the system temp directory is generated.
+    qmp_socket_path: ?[]const u8 = null,
+    /// How long to keep retrying the initial connection while the child
+    /// starts up and creates its QMP socket.
+    connect_timeout: Io.Duration = .fromSeconds(10),
+    /// How long to wait between connection attempts.
+    connect_retry_interval: Io.Duration = .fromMilliseconds(50),
+    stdout: std.process.SpawnOptions.StdIo = .inherit,
+    stderr: std.process.SpawnOptions.StdIo = .inherit,
+};
+
+/// A `qemu-system-*` (or similar) process spawned by `spawnAndConnect`,
+/// together with its connected QMP `Client`.
+pub const Spawned = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    child: std.process.Child,
+    client: *Client,
+    qmp_socket_path: []const u8,
+
+    /// Closes the QMP connection. Does *not* stop the child process --
+    /// call `quit()` over `client` (before `deinit`) for a graceful
+    /// shutdown, or `kill()` to force-terminate it.
+    pub fn deinit(self: *Spawned) void {
+        self.client.close();
+        self.allocator.free(self.qmp_socket_path);
+    }
+
+    /// Forcibly terminates the child process and waits for it to exit.
+    pub fn kill(self: *Spawned) void {
+        self.child.kill(self.io);
+    }
+
+    /// Waits for the child process to exit (e.g. after sending it a QMP
+    /// `quit` command over `client`).
+    pub fn wait(self: *Spawned) !std.process.Child.Term {
+        return self.child.wait(self.io);
+    }
+};
+
+/// Launches `options.binary` with a generated (or explicit)
+/// `-qmp unix:<path>,server=on,wait=off` argument, waits for the control
+/// socket to appear and the greeting/capabilities handshake to succeed, and
+/// returns the running child process together with a connected `Client`.
+pub fn spawnAndConnect(allocator: std.mem.Allocator, io: Io, options: SpawnOptions) !Spawned {
+    const sock_path = if (options.qmp_socket_path) |p|
+        try allocator.dupe(u8, p)
+    else
+        try randomTempSocketPath(allocator, io);
+    errdefer allocator.free(sock_path);
+
+    const qmp_arg = try std.fmt.allocPrint(allocator, "unix:{s},server=on,wait=off", .{sock_path});
+    defer allocator.free(qmp_arg);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, options.binary);
+    try argv.appendSlice(allocator, options.extra_args);
+    try argv.append(allocator, "-qmp");
+    try argv.append(allocator, qmp_arg);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = options.stdout,
+        .stderr = options.stderr,
+    });
+    errdefer child.kill(io);
+
+    const deadline = Io.Clock.awake.now(io).addDuration(options.connect_timeout);
+    const client = while (true) {
+        break Client.connectUnix(allocator, io, sock_path) catch |err| {
+            if (Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return err;
+            try Io.sleep(io, options.connect_retry_interval, .awake);
+            continue;
+        };
+    };
+
+    return .{
+        .allocator = allocator,
+        .io = io,
+        .child = child,
+        .client = client,
+        .qmp_socket_path = sock_path,
+    };
+}
+
+fn randomTempSocketPath(allocator: std.mem.Allocator, io: Io) ![]u8 {
+    var rand_bytes: [8]u8 = undefined;
+    Io.random(io, &rand_bytes);
+    const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+    return std.fmt.allocPrint(allocator, "/tmp/qmp-{s}.sock", .{&hex});
+}
 
 test "readFrame: classifies the server greeting" {
     var r = Io.Reader.fixed(
@@ -398,4 +534,13 @@ test "writeCommand: omits arguments when null" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("query-status", obj.get("execute").?.string);
     try std.testing.expect(obj.get("arguments") == null);
+}
+
+test "qapi: generated module fully type-checks" {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        for (@typeInfo(qapi).@"struct".decls) |decl| {
+            _ = @field(qapi, decl.name);
+        }
+    }
 }

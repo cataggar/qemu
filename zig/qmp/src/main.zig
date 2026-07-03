@@ -6,6 +6,10 @@
 //!                                          JSON arguments), print the return value
 //!                                          (or error) to stdout, disconnect
 //!   qmp watch    <socket> <count>          connect, print <count> events (blocking), disconnect
+//!   qmp spawn-status <qemu-binary> [extra-args...]
+//!                                          spawn <qemu-binary> via Client.spawnAndConnect,
+//!                                          run the typed qapi.queryStatus binding, print
+//!                                          its result, then qapi.quit it
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,13 +24,26 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_fw.interface;
 
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 3) {
+    if (args.len < 2) {
         try usage(out);
         try out.flush();
         return error.Usage;
     }
 
     const cmd = args[1];
+
+    if (std.mem.eql(u8, cmd, "spawn-status")) {
+        if (args.len < 3) return error.Usage;
+        try spawnStatusCmd(arena, io, out, args[2], args[3..]);
+        try out.flush();
+        return;
+    }
+
+    if (args.len < 3) {
+        try usage(out);
+        try out.flush();
+        return error.Usage;
+    }
     const socket_path = args[2];
 
     if (std.mem.eql(u8, cmd, "greeting")) {
@@ -58,6 +75,9 @@ fn usage(out: *Io.Writer) !void {
         \\  qmp exec     <socket> <command> [json-args]
         \\                                         run a command, print its result
         \\  qmp watch    <socket> <count>          print <count> events (blocking)
+        \\  qmp spawn-status <qemu-binary> [extra-args...]
+        \\                                         spawn + connect, run the typed
+        \\                                         qapi.queryStatus binding, then quit
         \\
     );
 }
@@ -117,4 +137,32 @@ fn watchCmd(allocator: std.mem.Allocator, io: Io, out: *Io.Writer, socket_path: 
             try out.writeByte('\n');
         }
     }
+}
+
+/// `spawn-status <qemu-binary> [extra-args...]`: exercises `spawnAndConnect`
+/// plus the QAPI-generated typed bindings end-to-end -- launches
+/// `qemu-binary`, waits for its QMP socket, runs the typed `queryStatus`
+/// command, prints the (typed, not raw-JSON) result, then `quit`s it.
+fn spawnStatusCmd(
+    allocator: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    binary: []const u8,
+    extra_args: []const []const u8,
+) !void {
+    var spawned = try qmp.spawnAndConnect(allocator, io, .{
+        .binary = binary,
+        .extra_args = extra_args,
+    });
+    defer spawned.deinit();
+
+    var status = try qmp.qapi.queryStatus(spawned.client, allocator);
+    defer status.deinit();
+    try out.print("running={} status={s}\n", .{ status.value.running, @tagName(status.value.status) });
+
+    var quit_reply = try qmp.qapi.quit(spawned.client, allocator);
+    defer quit_reply.deinit();
+
+    const term = try spawned.wait();
+    try out.print("term={any}\n", .{term});
 }
