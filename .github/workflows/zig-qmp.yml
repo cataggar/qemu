@@ -1,0 +1,81 @@
+name: zig-qmp
+
+on:
+  push:
+    branches: [zig16]
+    paths:
+      - 'zig/qmp/**'
+      - '.github/workflows/zig-qmp.yml'
+  pull_request:
+    paths:
+      - 'zig/qmp/**'
+      - '.github/workflows/zig-qmp.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zig/qmp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build CLI
+        run: zig build
+
+  integration:
+    # Stretch goal: cross-validate the client against a real qemu-system-x86_64
+    # build (via `zig cc`). Not yet promoted to a required check, so it
+    # doesn't block merges while the Ubuntu build-dependency list is proven
+    # out across real runs.
+    name: Cross-validate against qemu-system-x86_64
+    runs-on: ubuntu-latest
+    needs: test
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install QEMU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config python3 python3-pip python3-venv \
+            libglib2.0-dev libpixman-1-dev zlib1g-dev
+
+      - name: Build qemu-system-x86_64 with zig cc
+        run: scripts/build-with-zig-cc.sh build-zig --target-list=x86_64-softmmu
+        # Builds every default target for x86_64-softmmu (not just
+        # qemu-system-x86_64); slower than strictly necessary but keeps this
+        # job a thin, low-maintenance wrapper around the existing build script.
+
+      - name: Build qmp CLI
+        working-directory: zig/qmp
+        run: zig build
+
+      - name: Cross-validate client against qemu-system-x86_64
+        run: zig/qmp/scripts/cross-validate.sh build-zig zig/qmp/zig-out/bin/qmp
