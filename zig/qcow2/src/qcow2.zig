@@ -11,6 +11,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const flate = std.compress.flate;
+const zstd = std.compress.zstd;
 
 pub const magic: u32 = 0x514649fb; // "QFI\xfb"
 
@@ -111,10 +113,17 @@ pub const Error = error{
     UnknownIncompatibleFeature,
     // Read path
     OutOfRange,
-    UnsupportedCompressed,
     UnsupportedBackingFile,
     UnsupportedExtendedL2,
+    UnsupportedCompressionType,
     CorruptMapping,
+    DecompressFailed,
+};
+
+/// Location of a compressed cluster's payload within the image file.
+pub const CompressedRef = struct {
+    coffset: u64, // exact byte offset of compressed data (not sector aligned)
+    csize: u32, // number of compressed bytes to read
 };
 
 /// Classification of a single guest cluster's backing store.
@@ -122,7 +131,7 @@ pub const Mapping = union(enum) {
     unallocated, // read from backing file or zeros
     zero, // reads as zeros (zero bit set)
     standard: u64, // host file offset of the cluster data
-    compressed, // compressed descriptor (not yet decoded)
+    compressed: CompressedRef,
 };
 
 const l2e_offset_mask: u64 = 0x00fffffffffffe00; // bits 9..55
@@ -148,7 +157,9 @@ pub const Image = struct {
         const file = try dir.openFile(io, path, .{ .mode = .read_only });
         errdefer file.close(io);
 
-        var head_buf: [104]u8 = undefined;
+        // Read enough for the full v3 header including the compression_type
+        // field at offset 104 and any leading padding.
+        var head_buf: [512]u8 = undefined;
         const n = try file.readPositionalAll(io, &head_buf, 0);
         if (n < 72) return error.Truncated;
         const header = try Header.parse(head_buf[0..n]);
@@ -201,7 +212,20 @@ pub const Image = struct {
         if (got != entry_buf.len) return error.CorruptMapping;
         const l2_entry = std.mem.readInt(u64, &entry_buf, .big);
 
-        if ((l2_entry & l2e_compressed) != 0) return .compressed;
+        if ((l2_entry & l2e_compressed) != 0) {
+            // Compressed cluster descriptor.
+            //   csize_shift = 62 - (cluster_bits - 8)
+            //   csize_mask  = (1 << (cluster_bits - 8)) - 1
+            //   offset_mask = (1 << csize_shift) - 1
+            const csize_shift: u6 = @intCast(62 - (self.header.cluster_bits - 8));
+            const csize_mask: u64 = (@as(u64, 1) << @intCast(self.header.cluster_bits - 8)) - 1;
+            const offset_mask: u64 = (@as(u64, 1) << csize_shift) - 1;
+            const coffset = l2_entry & offset_mask;
+            const nb_csectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+            const sector_size: u64 = 512;
+            const csize = nb_csectors * sector_size - (coffset & (sector_size - 1));
+            return .{ .compressed = .{ .coffset = coffset, .csize = @intCast(csize) } };
+        }
 
         const host_offset = l2_entry & l2e_offset_mask;
         if ((l2_entry & standard_zero_bit) != 0) return .zero;
@@ -209,9 +233,49 @@ pub const Image = struct {
         return .{ .standard = host_offset };
     }
 
+    /// Decompress the single guest cluster described by `ref` into `dst`,
+    /// which must be exactly one cluster in size. Any tail not produced by the
+    /// decompressor is zero-filled.
+    fn decompressCluster(self: *Image, ref: CompressedRef, dst: []u8) !void {
+        const comp = try self.allocator.alloc(u8, ref.csize);
+        defer self.allocator.free(comp);
+        const got = try self.file.readPositionalAll(self.io, comp, ref.coffset);
+        if (got != comp.len) return error.Truncated;
+
+        var in: Io.Reader = .fixed(comp[0..got]);
+
+        const produced = switch (self.header.compression_type) {
+            0 => blk: {
+                // Raw deflate (no zlib header). It stops at its end-of-block
+                // marker, so streaming the remainder into a cluster-sized
+                // writer is safe and ignores the trailing sector padding.
+                var out: Io.Writer = .fixed(dst);
+                var d: flate.Decompress = .init(&in, .raw, &.{});
+                break :blk d.reader.streamRemaining(&out) catch |e| switch (e) {
+                    error.WriteFailed => dst.len, // filled a whole cluster
+                    else => return error.DecompressFailed,
+                };
+            },
+            1 => blk: {
+                // Indirect mode: give the decoder a window buffer sized to the
+                // cluster, then read exactly one cluster out. We must NOT drain
+                // the input, since qcow2 pads the payload to a sector boundary
+                // and streamRemaining would misparse the trailing bytes as a
+                // second zstd frame.
+                const wlen: u32 = @intCast(@max(dst.len, 1));
+                const zbuf = try self.allocator.alloc(u8, @as(usize, wlen) + zstd.block_size_max);
+                defer self.allocator.free(zbuf);
+                var d: zstd.Decompress = .init(&in, zbuf, .{ .window_len = wlen });
+                break :blk d.reader.readSliceShort(dst) catch return error.DecompressFailed;
+            },
+            else => return error.UnsupportedCompressionType,
+        };
+        if (produced < dst.len) @memset(dst[produced..], 0);
+    }
+
     /// Read `buf.len` bytes starting at `guest_offset` from the virtual disk.
     /// Unallocated and zero clusters read as zeros (backing files not yet
-    /// followed). Compressed clusters return `error.UnsupportedCompressed`.
+    /// followed). Compressed clusters are decoded in-place.
     pub fn read(self: *Image, guest_offset: u64, buf: []u8) !void {
         if (self.header.backing_file_offset != 0)
             return error.UnsupportedBackingFile;
@@ -227,7 +291,13 @@ pub const Image = struct {
 
             switch (try self.mapCluster(pos)) {
                 .unallocated, .zero => @memset(dst, 0),
-                .compressed => return error.UnsupportedCompressed,
+                .compressed => |ref| {
+                    // Decompress the full cluster, then copy the requested slice.
+                    const tmp = try self.allocator.alloc(u8, cs);
+                    defer self.allocator.free(tmp);
+                    try self.decompressCluster(ref, tmp);
+                    @memcpy(dst, tmp[in_cluster .. in_cluster + chunk]);
+                },
                 .standard => |host_offset| {
                     const got = try self.file.readPositionalAll(
                         self.io,
@@ -269,6 +339,19 @@ test "parse minimal v3 header" {
     try std.testing.expectEqual(@as(u64, 65536), h.clusterSize());
     try std.testing.expectEqual(@as(u64, 8192), h.l2Entries());
     try std.testing.expect(!h.hasIncompatible(.dirty));
+}
+
+test "parse compression_type field (zstd)" {
+    var buf: [112]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big);
+    std.mem.writeInt(u32, buf[20..24], 16, .big);
+    std.mem.writeInt(u64, buf[72..80], 1 << 3, .big); // incompatible: compression type bit
+    std.mem.writeInt(u32, buf[100..104], 112, .big); // header_length includes byte 104
+    buf[104] = 1; // compression_type = zstd
+    const h = try Header.parse(&buf);
+    try std.testing.expectEqual(@as(u8, 1), h.compression_type);
+    try std.testing.expect(h.hasIncompatible(.compression_type));
 }
 
 test "reject bad magic" {
