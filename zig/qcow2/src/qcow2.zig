@@ -113,11 +113,11 @@ pub const Error = error{
     UnknownIncompatibleFeature,
     // Read path
     OutOfRange,
-    UnsupportedBackingFile,
     UnsupportedExtendedL2,
     UnsupportedCompressionType,
     CorruptMapping,
     DecompressFailed,
+    BackingChainTooDeep,
 };
 
 /// Location of a compressed cluster's payload within the image file.
@@ -143,10 +143,15 @@ const standard_zero_bit: u64 = 1; // bit 0 of standard cluster descriptor
 /// `close`.
 pub const Image = struct {
     io: Io,
+    dir: Io.Dir,
     file: Io.File,
     header: Header,
     l1: []u64, // active L1 table, host-endian
     allocator: std.mem.Allocator,
+    backing: ?*Image = null, // backing image in the chain, if any
+    backing_name: ?[]u8 = null, // owned; the raw backing file name
+
+    const max_backing_depth = 32;
 
     pub fn open(
         allocator: std.mem.Allocator,
@@ -154,6 +159,17 @@ pub const Image = struct {
         dir: Io.Dir,
         path: []const u8,
     ) !Image {
+        return openDepth(allocator, io, dir, path, 0);
+    }
+
+    fn openDepth(
+        allocator: std.mem.Allocator,
+        io: Io,
+        dir: Io.Dir,
+        path: []const u8,
+        depth: u32,
+    ) !Image {
+        if (depth >= max_backing_depth) return error.BackingChainTooDeep;
         const file = try dir.openFile(io, path, .{ .mode = .read_only });
         errdefer file.close(io);
 
@@ -174,16 +190,42 @@ pub const Image = struct {
             for (l1) |*e| e.* = std.mem.bigToNative(u64, e.*);
         }
 
-        return .{
+        var img: Image = .{
             .io = io,
+            .dir = dir,
             .file = file,
             .header = header,
             .l1 = l1,
             .allocator = allocator,
         };
+
+        // Open the backing image, if any. Its name is relative to the
+        // directory containing this image (unless absolute).
+        if (header.backing_file_offset != 0 and header.backing_file_size != 0) {
+            if (header.backing_file_size > 1023) return error.CorruptMapping;
+            const name = try allocator.alloc(u8, header.backing_file_size);
+            errdefer allocator.free(name);
+            const got = try file.readPositionalAll(io, name, header.backing_file_offset);
+            if (got != name.len) return error.Truncated;
+            img.backing_name = name;
+
+            const full = try resolveBackingPath(allocator, path, name);
+            defer allocator.free(full);
+            const child = try allocator.create(Image);
+            errdefer allocator.destroy(child);
+            child.* = try openDepth(allocator, io, dir, full, depth + 1);
+            img.backing = child;
+        }
+
+        return img;
     }
 
     pub fn close(self: *Image) void {
+        if (self.backing) |b| {
+            b.close();
+            self.allocator.destroy(b);
+        }
+        if (self.backing_name) |name| self.allocator.free(name);
         self.allocator.free(self.l1);
         self.file.close(self.io);
         self.* = undefined;
@@ -277,9 +319,6 @@ pub const Image = struct {
     /// Unallocated and zero clusters read as zeros (backing files not yet
     /// followed). Compressed clusters are decoded in-place.
     pub fn read(self: *Image, guest_offset: u64, buf: []u8) !void {
-        if (self.header.backing_file_offset != 0)
-            return error.UnsupportedBackingFile;
-
         const cs = self.header.clusterSize();
         var pos: u64 = guest_offset;
         var written: usize = 0;
@@ -290,7 +329,8 @@ pub const Image = struct {
             const dst = buf[written .. written + chunk];
 
             switch (try self.mapCluster(pos)) {
-                .unallocated, .zero => @memset(dst, 0),
+                .zero => @memset(dst, 0),
+                .unallocated => try self.readBacking(pos, dst),
                 .compressed => |ref| {
                     // Decompress the full cluster, then copy the requested slice.
                     const tmp = try self.allocator.alloc(u8, cs);
@@ -311,7 +351,37 @@ pub const Image = struct {
             written += chunk;
         }
     }
+
+    /// Fill `dst` (covering guest range [pos, pos+dst.len)) from the backing
+    /// image. Ranges with no backing file, or beyond the backing image's
+    /// virtual size, read as zeros.
+    fn readBacking(self: *Image, pos: u64, dst: []u8) anyerror!void {
+        const backing = self.backing orelse {
+            @memset(dst, 0);
+            return;
+        };
+        if (pos >= backing.header.size) {
+            @memset(dst, 0);
+            return;
+        }
+        const avail = backing.header.size - pos;
+        const from_backing: usize = @intCast(@min(@as(u64, dst.len), avail));
+        try backing.read(pos, dst[0..from_backing]);
+        if (from_backing < dst.len) @memset(dst[from_backing..], 0);
+    }
 };
+
+/// Resolve a backing-file name against the directory of the parent image path.
+/// Absolute names are returned as-is. Caller owns the returned slice.
+fn resolveBackingPath(
+    allocator: std.mem.Allocator,
+    parent_path: []const u8,
+    name: []const u8,
+) ![]u8 {
+    if (name.len > 0 and name[0] == '/') return allocator.dupe(u8, name);
+    const dir = std.fs.path.dirname(parent_path) orelse return allocator.dupe(u8, name);
+    return std.fs.path.join(allocator, &.{ dir, name });
+}
 
 fn rd32(buf: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, buf[off..][0..4], .big);

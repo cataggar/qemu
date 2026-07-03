@@ -71,6 +71,7 @@ fn info(out: *Io.Writer, img: *qcow2.Image) !void {
     try out.print("l2 entries/table:   {d}\n", .{h.l2Entries()});
     try out.print("snapshots:          {d}\n", .{h.nb_snapshots});
     try out.print("has backing file:   {}\n", .{h.backing_file_offset != 0});
+    if (img.backing_name) |name| try out.print("backing file:       {s}\n", .{name});
     try out.print("compression type:   {s}\n", .{if (h.compression_type == 1) "zstd" else "deflate"});
     try out.print("incompatible bits:  0x{x}\n", .{h.incompatible_features});
     try out.print("  non-default compression: {}\n", .{h.hasIncompatible(.compression_type)});
