@@ -5,7 +5,8 @@
 //!
 //! Scope: read path for v2/v3 images, including standard, zero, unallocated,
 //! and compressed clusters, backing-file chains, and Extended L2 Entries
-//! (per-subcluster allocation). See `writer.zig` for image creation.
+//! (per-subcluster allocation), plus refcount lookups and a basic
+//! consistency check (`Image.check`). See `writer.zig` for image creation.
 //!
 //! All multi-byte integers in qcow2 are stored big-endian.
 
@@ -76,6 +77,16 @@ pub const Header = struct {
         return self.clusterSize() / Header.subclusters_per_cluster;
     }
 
+    /// Bits per refcount entry: `1 << refcount_order` (1 to 64).
+    pub fn refcountBits(self: Header) u64 {
+        return @as(u64, 1) << @intCast(self.refcount_order);
+    }
+
+    /// Number of refcount entries per refcount block cluster.
+    pub fn refcountBlockEntries(self: Header) u64 {
+        return self.clusterSize() * 8 / self.refcountBits();
+    }
+
     pub fn hasIncompatible(self: Header, bit: IncompatibleBit) bool {
         return (self.incompatible_features & (@as(u64, 1) << @intFromEnum(bit))) != 0;
     }
@@ -127,6 +138,9 @@ pub const Header = struct {
         if (h.hasIncompatible(.extended_l2) and h.cluster_bits < 14)
             return error.BadClusterBits;
 
+        // Per spec: refcount_order may not exceed 6 (i.e. refcount_bits = 64).
+        if (h.refcount_order > 6) return error.BadRefcountOrder;
+
         return h;
     }
 };
@@ -136,6 +150,7 @@ pub const Error = error{
     BadMagic,
     UnsupportedVersion,
     BadClusterBits,
+    BadRefcountOrder,
     UnknownIncompatibleFeature,
     // Read path
     OutOfRange,
@@ -159,10 +174,46 @@ pub const Mapping = union(enum) {
     compressed: CompressedRef,
 };
 
+/// A single consistency issue found by `Image.check`.
+pub const Finding = struct {
+    pub const Kind = enum {
+        /// A cluster referenced by metadata has a stored refcount of 0.
+        used_cluster_zero_refcount,
+        /// A cluster's stored refcount doesn't match the number of times
+        /// this walk found it referenced.
+        refcount_mismatch,
+        /// A cluster has a nonzero stored refcount but nothing in this
+        /// walk referenced it.
+        leaked_cluster,
+    };
+    kind: Kind,
+    /// Cluster index (host_offset / cluster_size), not a byte offset.
+    cluster_index: u64,
+    stored: u64,
+    computed: u64,
+};
+
+/// Result of `Image.check`: a basic (not exhaustive) consistency check
+/// against the reference-counting metadata.
+pub const CheckReport = struct {
+    /// Distinct clusters referenced by the metadata walk.
+    allocated_clusters: u64 = 0,
+    findings: std.ArrayList(Finding) = .empty,
+
+    pub fn deinit(self: *CheckReport, allocator: std.mem.Allocator) void {
+        self.findings.deinit(allocator);
+    }
+
+    pub fn isClean(self: CheckReport) bool {
+        return self.findings.items.len == 0;
+    }
+};
+
 const l2e_offset_mask: u64 = 0x00fffffffffffe00; // bits 9..55
 const l2e_compressed: u64 = @as(u64, 1) << 62;
 const l1e_offset_mask: u64 = 0x00fffffffffffe00;
 const standard_zero_bit: u64 = 1; // bit 0 of standard cluster descriptor
+const refcount_table_offset_mask: u64 = ~@as(u64, 0x1ff); // bits 9..63
 
 /// An opened qcow2 image. Backed by a file handle; caller owns lifetime via
 /// `close`.
@@ -324,6 +375,228 @@ pub const Image = struct {
         return .{ .standard = host_offset + @as(u64, subcluster_index) * subcluster_size };
     }
 
+    /// Look up the reference count of the cluster containing `host_offset`
+    /// (a byte offset into the image *file*, not the guest disk). Per spec,
+    /// a refcount block that has never been allocated (refcount table entry
+    /// == 0) implicitly means every cluster it would cover has a refcount
+    /// of 0.
+    pub fn refcountAt(self: *Image, host_offset: u64) !u64 {
+        const cs = self.header.clusterSize();
+        const rb_entries = self.header.refcountBlockEntries();
+        const cluster_index = host_offset / cs;
+        const rt_index = cluster_index / rb_entries;
+        const rb_index = cluster_index % rb_entries;
+
+        var rt_buf: [8]u8 = undefined;
+        const rt_at = self.header.refcount_table_offset + rt_index * @sizeOf(u64);
+        const rt_got = try self.file.readPositionalAll(self.io, &rt_buf, rt_at);
+        if (rt_got != rt_buf.len) return error.CorruptMapping;
+        const rb_offset = std.mem.readInt(u64, &rt_buf, .big) & refcount_table_offset_mask;
+        if (rb_offset == 0) return 0;
+
+        // Layout matches QEMU's get_refcount_ro{0..6} (block/qcow2-refcount.c):
+        // orders 0-2 pack 8/4/2 sub-byte entries per byte, LSB-first; orders
+        // 3-6 are plain big-endian 1/2/4/8-byte entries.
+        const order = self.header.refcount_order;
+        switch (order) {
+            0, 1, 2 => {
+                const entries_per_byte: u64 = @as(u64, 1) << @intCast(3 - order);
+                const byte_index = rb_index / entries_per_byte;
+                const width_bits: u3 = @as(u3, 1) << @intCast(order);
+                const shift: u3 = @intCast((rb_index % entries_per_byte) << @intCast(order));
+                const mask: u8 = (@as(u8, 1) << width_bits) - 1;
+                var b: [1]u8 = undefined;
+                const got = try self.file.readPositionalAll(self.io, &b, rb_offset + byte_index);
+                if (got != 1) return error.CorruptMapping;
+                return (b[0] >> shift) & mask;
+            },
+            3, 4, 5, 6 => {
+                const width_bytes: u64 = @as(u64, 1) << @intCast(order - 3);
+                var b: [8]u8 = undefined;
+                const at = rb_offset + rb_index * width_bytes;
+                const got = try self.file.readPositionalAll(self.io, b[0..width_bytes], at);
+                if (got != width_bytes) return error.CorruptMapping;
+                return switch (width_bytes) {
+                    1 => b[0],
+                    2 => std.mem.readInt(u16, b[0..2], .big),
+                    4 => std.mem.readInt(u32, b[0..4], .big),
+                    8 => std.mem.readInt(u64, b[0..8], .big),
+                    else => unreachable,
+                };
+            },
+            else => unreachable, // Header.parse rejects refcount_order > 6
+        }
+    }
+
+    const ClusterRef = struct {
+        count: u64 = 0,
+        // False for clusters only ever referenced by a compressed payload:
+        // per spec, multiple compressed extents may validly share a single
+        // host cluster, so an exact refcount match can't be required there
+        // (only that the stored refcount is nonzero).
+        exact: bool = true,
+    };
+
+    fn markCluster(map: *std.AutoHashMap(u64, ClusterRef), cluster_index: u64, exact: bool) !void {
+        const gop = try map.getOrPut(cluster_index);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.count += 1;
+        if (!exact) gop.value_ptr.exact = false;
+    }
+
+    /// Walk this image's own metadata (header, L1/L2 tables, data clusters,
+    /// refcount table/blocks) and cross-check it against stored refcounts:
+    /// every referenced cluster must have a nonzero stored refcount and
+    /// (except for compressed-cluster hosts, see `ClusterRef`) match the
+    /// number of times it was referenced; every cluster in the file with a
+    /// nonzero stored refcount must have been referenced at least once
+    /// (otherwise it's reported as leaked).
+    ///
+    /// This intentionally does not recurse into a backing image (matching
+    /// `qemu-img check`, which checks one image at a time) and does not
+    /// walk snapshot L1 tables (snapshots are not yet implemented -- see
+    /// issue #10). It also isn't optimized for huge images: the leaked-
+    /// cluster pass calls `refcountAt` once per cluster in the file.
+    pub fn check(self: *Image, allocator: std.mem.Allocator) !CheckReport {
+        var computed = std.AutoHashMap(u64, ClusterRef).init(allocator);
+        defer computed.deinit();
+
+        const cs = self.header.clusterSize();
+
+        // The header always occupies the first cluster of the file.
+        try markCluster(&computed, 0, true);
+
+        // L1 table cluster(s).
+        if (self.header.l1_size != 0) {
+            const l1_bytes = @as(u64, self.header.l1_size) * @sizeOf(u64);
+            const l1_clusters = (l1_bytes + cs - 1) / cs;
+            const l1_start = self.header.l1_table_offset / cs;
+            var i: u64 = 0;
+            while (i < l1_clusters) : (i += 1) try markCluster(&computed, l1_start + i, true);
+        }
+
+        // Backing file name bytes (bounded to 1023 bytes by Image.open, but
+        // may still span more than one cluster on tiny-cluster images).
+        // Skip cluster 0: the name commonly lives inside the header cluster
+        // itself (already marked above), and that's not an independent
+        // reference -- only a name that spills into cluster(s) beyond the
+        // header needs its own mark.
+        if (self.header.backing_file_offset != 0 and self.header.backing_file_size != 0) {
+            const start = self.header.backing_file_offset / cs;
+            const end = (self.header.backing_file_offset + self.header.backing_file_size - 1) / cs;
+            var c = start;
+            while (c <= end) : (c += 1) {
+                if (c == 0) continue;
+                try markCluster(&computed, c, true);
+            }
+        }
+
+        const entry_size = self.header.l2EntrySize();
+        const l2_entries = self.header.l2Entries();
+        const l2_buf = try allocator.alloc(u8, cs);
+        defer allocator.free(l2_buf);
+
+        for (self.l1) |l1_entry| {
+            const l2_offset = l1_entry & l1e_offset_mask;
+            if (l2_offset == 0) continue;
+            try markCluster(&computed, l2_offset / cs, true);
+
+            const got = try self.file.readPositionalAll(self.io, l2_buf, l2_offset);
+            if (got != l2_buf.len) return error.Truncated;
+
+            var idx: u64 = 0;
+            while (idx < l2_entries) : (idx += 1) {
+                const at = idx * entry_size;
+                const l2_entry = std.mem.readInt(u64, l2_buf[at..][0..8], .big);
+
+                if ((l2_entry & l2e_compressed) != 0) {
+                    const csize_shift: u6 = @intCast(62 - (self.header.cluster_bits - 8));
+                    const csize_mask: u64 = (@as(u64, 1) << @intCast(self.header.cluster_bits - 8)) - 1;
+                    const offset_mask: u64 = (@as(u64, 1) << csize_shift) - 1;
+                    const coffset = l2_entry & offset_mask;
+                    const nb_csectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+                    const sector_size: u64 = 512;
+                    const csize = nb_csectors * sector_size - (coffset & (sector_size - 1));
+                    if (csize != 0) {
+                        const first_cluster = coffset / cs;
+                        const last_cluster = (coffset + csize - 1) / cs;
+                        var cc = first_cluster;
+                        while (cc <= last_cluster) : (cc += 1) try markCluster(&computed, cc, false);
+                    }
+                    continue;
+                }
+
+                const host_offset = l2_entry & l2e_offset_mask;
+                if (host_offset != 0) try markCluster(&computed, host_offset / cs, true);
+            }
+        }
+
+        // Refcount table cluster(s) and the refcount blocks they point to.
+        var rti: u64 = 0;
+        while (rti < self.header.refcount_table_clusters) : (rti += 1) {
+            try markCluster(&computed, (self.header.refcount_table_offset / cs) + rti, true);
+        }
+        if (self.header.refcount_table_clusters != 0) {
+            const rt_bytes = @as(u64, self.header.refcount_table_clusters) * cs;
+            const rt_buf = try allocator.alloc(u8, rt_bytes);
+            defer allocator.free(rt_buf);
+            const got = try self.file.readPositionalAll(self.io, rt_buf, self.header.refcount_table_offset);
+            if (got != rt_buf.len) return error.Truncated;
+            var off: u64 = 0;
+            while (off < rt_bytes) : (off += @sizeOf(u64)) {
+                const entry = std.mem.readInt(u64, rt_buf[off..][0..8], .big);
+                const rb_offset = entry & refcount_table_offset_mask;
+                if (rb_offset != 0) try markCluster(&computed, rb_offset / cs, true);
+            }
+        }
+
+        var report: CheckReport = .{};
+        errdefer report.deinit(allocator);
+
+        var it = computed.iterator();
+        while (it.next()) |entry| {
+            const cluster_index = entry.key_ptr.*;
+            const ref = entry.value_ptr.*;
+            report.allocated_clusters += 1;
+            const stored = try self.refcountAt(cluster_index * cs);
+            if (stored == 0) {
+                try report.findings.append(allocator, .{
+                    .kind = .used_cluster_zero_refcount,
+                    .cluster_index = cluster_index,
+                    .stored = 0,
+                    .computed = ref.count,
+                });
+            } else if (ref.exact and stored != ref.count) {
+                try report.findings.append(allocator, .{
+                    .kind = .refcount_mismatch,
+                    .cluster_index = cluster_index,
+                    .stored = stored,
+                    .computed = ref.count,
+                });
+            }
+        }
+
+        // Leaked clusters: a nonzero stored refcount that nothing above
+        // referenced.
+        const stat = try self.file.stat(self.io);
+        const total_clusters = stat.size / cs;
+        var ci: u64 = 0;
+        while (ci < total_clusters) : (ci += 1) {
+            if (computed.contains(ci)) continue;
+            const stored = try self.refcountAt(ci * cs);
+            if (stored != 0) {
+                try report.findings.append(allocator, .{
+                    .kind = .leaked_cluster,
+                    .cluster_index = ci,
+                    .stored = stored,
+                    .computed = 0,
+                });
+            }
+        }
+
+        return report;
+    }
+
     /// Decompress the single guest cluster described by `ref` into `dst`,
     /// which must be exactly one cluster in size. Any tail not produced by the
     /// decompressor is zero-filled.
@@ -478,6 +751,34 @@ fn writeExtL2ImageHeader(buf: []u8, opts: ExtL2HeaderOpts) void {
     std.mem.writeInt(u32, buf[100..104], 104, .big); // header_length
 }
 
+/// Test-only helper: write a minimal v3 header (no incompatible features)
+/// into `buf[0..104]`, with configurable refcount fields for refcountAt
+/// tests. L1 fields default to empty (no L1 table needed for those tests).
+const V3HeaderOpts = struct {
+    cluster_bits: u32,
+    size: u64 = 0,
+    l1_size: u32 = 0,
+    l1_table_offset: u64 = 0,
+    refcount_table_offset: u64 = 0,
+    refcount_order: u32 = 4,
+    backing_file_offset: u64 = 0,
+    backing_file_size: u32 = 0,
+};
+fn writeV3ImageHeader(buf: []u8, opts: V3HeaderOpts) void {
+    @memset(buf[0..104], 0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big); // version
+    std.mem.writeInt(u64, buf[8..16], opts.backing_file_offset, .big);
+    std.mem.writeInt(u32, buf[16..20], opts.backing_file_size, .big);
+    std.mem.writeInt(u32, buf[20..24], opts.cluster_bits, .big);
+    std.mem.writeInt(u64, buf[24..32], opts.size, .big);
+    std.mem.writeInt(u32, buf[36..40], opts.l1_size, .big);
+    std.mem.writeInt(u64, buf[40..48], opts.l1_table_offset, .big);
+    std.mem.writeInt(u64, buf[48..56], opts.refcount_table_offset, .big);
+    std.mem.writeInt(u32, buf[96..100], opts.refcount_order, .big);
+    std.mem.writeInt(u32, buf[100..104], 104, .big); // header_length
+}
+
 test "parse minimal v3 header" {
     var buf: [104]u8 = @splat(0);
     std.mem.writeInt(u32, buf[0..4], magic, .big);
@@ -493,6 +794,33 @@ test "parse minimal v3 header" {
     try std.testing.expectEqual(@as(u64, 65536), h.clusterSize());
     try std.testing.expectEqual(@as(u64, 8192), h.l2Entries());
     try std.testing.expect(!h.hasIncompatible(.dirty));
+}
+
+test "refcount_order affects refcountBits/refcountBlockEntries" {
+    var buf: [104]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big);
+    std.mem.writeInt(u32, buf[20..24], 16, .big); // 64 KiB clusters
+    std.mem.writeInt(u32, buf[96..100], 4, .big); // refcount_order = 4 (default): 16-bit
+    std.mem.writeInt(u32, buf[100..104], 104, .big);
+    const h4 = try Header.parse(&buf);
+    try std.testing.expectEqual(@as(u64, 16), h4.refcountBits());
+    try std.testing.expectEqual(@as(u64, 32768), h4.refcountBlockEntries()); // 65536*8/16
+
+    std.mem.writeInt(u32, buf[96..100], 6, .big); // refcount_order = 6 => 64-bit refcounts
+    const h6 = try Header.parse(&buf);
+    try std.testing.expectEqual(@as(u64, 64), h6.refcountBits());
+    try std.testing.expectEqual(@as(u64, 8192), h6.refcountBlockEntries()); // 65536*8/64
+}
+
+test "reject refcount_order > 6" {
+    var buf: [104]u8 = @splat(0);
+    std.mem.writeInt(u32, buf[0..4], magic, .big);
+    std.mem.writeInt(u32, buf[4..8], 3, .big);
+    std.mem.writeInt(u32, buf[20..24], 16, .big);
+    std.mem.writeInt(u32, buf[96..100], 7, .big); // refcount_order = 7: invalid
+    std.mem.writeInt(u32, buf[100..104], 104, .big);
+    try std.testing.expectError(error.BadRefcountOrder, Header.parse(&buf));
 }
 
 test "parse compression_type field (zstd)" {
@@ -822,3 +1150,367 @@ test "extended L2: compressed cluster descriptor is unaffected by subclusters" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "refcountAt: order 4 (16-bit) refcount block lookups" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14; // 16 KiB clusters
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    // Layout: cluster 0 = header, 1 = refcount table, 2 = refcount block.
+    // refcountAt never touches L1/L2, so this file needs nothing else.
+    const file = try a.alloc(u8, 3 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const rt_offset = 1 * cs;
+    const rb_offset = 2 * cs;
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .refcount_table_offset = rt_offset,
+        .refcount_order = 4,
+    });
+    std.mem.writeInt(u64, file[@intCast(rt_offset)..][0..8], rb_offset, .big);
+
+    // 16-bit big-endian refcount entries: index 0 = 1, index 1 = 5, index 2
+    // = 0, index 5 = 1; everything else is implicitly 0 (zeroed buffer).
+    std.mem.writeInt(u16, file[@intCast(rb_offset + 0 * 2)..][0..2], 1, .big);
+    std.mem.writeInt(u16, file[@intCast(rb_offset + 1 * 2)..][0..2], 5, .big);
+    std.mem.writeInt(u16, file[@intCast(rb_offset + 5 * 2)..][0..2], 1, .big);
+
+    const out_file = try tmp.dir.createFile(io, "rc.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "rc.qcow2");
+    defer img.close();
+
+    try std.testing.expectEqual(@as(u64, 1), try img.refcountAt(0 * cs));
+    try std.testing.expectEqual(@as(u64, 5), try img.refcountAt(1 * cs));
+    try std.testing.expectEqual(@as(u64, 0), try img.refcountAt(2 * cs));
+    try std.testing.expectEqual(@as(u64, 1), try img.refcountAt(5 * cs));
+    try std.testing.expectEqual(@as(u64, 0), try img.refcountAt(100 * cs)); // same block, unset
+}
+
+test "refcountAt: sub-byte order 0 (1-bit) packing" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const file = try a.alloc(u8, 3 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const rt_offset = 1 * cs;
+    const rb_offset = 2 * cs;
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .refcount_table_offset = rt_offset,
+        .refcount_order = 0,
+    });
+    std.mem.writeInt(u64, file[@intCast(rt_offset)..][0..8], rb_offset, .big);
+
+    // 1-bit entries, LSB-first: byte 0 = 0b0000_0101 -> index0=1, index1=0,
+    // index2=1, indices 3-7=0 (matches QEMU's get_refcount_ro0).
+    file[@intCast(rb_offset)] = 0b0000_0101;
+
+    const out_file = try tmp.dir.createFile(io, "rc0.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "rc0.qcow2");
+    defer img.close();
+
+    try std.testing.expectEqual(@as(u64, 1), try img.refcountAt(0 * cs));
+    try std.testing.expectEqual(@as(u64, 0), try img.refcountAt(1 * cs));
+    try std.testing.expectEqual(@as(u64, 1), try img.refcountAt(2 * cs));
+    try std.testing.expectEqual(@as(u64, 0), try img.refcountAt(3 * cs));
+}
+
+test "refcountAt: unallocated refcount block reads as 0" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    // Only cluster 0 (header) and cluster 1 (refcount table) exist; the
+    // table's only entry is left 0, so every refcount block it would cover
+    // is implicitly unallocated (refcount 0), including cluster index 0.
+    const file = try a.alloc(u8, 2 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .refcount_table_offset = 1 * cs,
+        .refcount_order = 4,
+    });
+
+    const out_file = try tmp.dir.createFile(io, "rc-empty.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "rc-empty.qcow2");
+    defer img.close();
+
+    try std.testing.expectEqual(@as(u64, 0), try img.refcountAt(0));
+}
+
+test "refcountAt: writer-created image has refcount 1 for the header cluster" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const vsize: u64 = 128 * 1024;
+    const data = try a.alloc(u8, vsize);
+    defer a.free(data);
+    for (data, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    try writer.createFromRaw(a, io, tmp.dir, "rc-writer.qcow2", data, vsize, .{});
+
+    var img = try Image.open(a, io, tmp.dir, "rc-writer.qcow2");
+    defer img.close();
+
+    // The writer sets every cluster's refcount to exactly 1 (see writer.zig).
+    try std.testing.expectEqual(@as(u64, 1), try img.refcountAt(0));
+}
+
+test "check(): writer-created image is clean" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const vsize: u64 = 512 * 1024;
+    const data = try a.alloc(u8, vsize);
+    defer a.free(data);
+    @memset(data, 0);
+    for (data[0..1000], 0..) |*b, i| b.* = @intCast(i % 251);
+    for (data[300 * 1024 ..][0..2048], 0..) |*b, i| b.* = @intCast((i * 7) % 253);
+
+    try writer.createFromRaw(a, io, tmp.dir, "check-clean.qcow2", data, vsize, .{});
+
+    var img = try Image.open(a, io, tmp.dir, "check-clean.qcow2");
+    defer img.close();
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(report.isClean());
+    try std.testing.expect(report.allocated_clusters > 0);
+}
+
+/// Builds a minimal, fully cross-linked qcow2 image by hand for check()
+/// tests: header (cluster 0), L1 table (1), L2 table (2), one data cluster
+/// (3), refcount table (4), refcount block (5). `data_refcount` lets tests
+/// deliberately corrupt the one stored refcount that matters; every other
+/// referenced cluster gets a correct refcount of 1.
+fn buildCheckFixture(a: std.mem.Allocator, io: Io, dir: Io.Dir, path: []const u8, data_refcount: u16) !void {
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const file = try a.alloc(u8, 6 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const l1_offset = 1 * cs;
+    const l2_offset = 2 * cs;
+    const data_offset = 3 * cs;
+    const rt_offset = 4 * cs;
+    const rb_offset = 5 * cs;
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = l1_offset,
+        .refcount_table_offset = rt_offset,
+        .refcount_order = 4,
+    });
+    std.mem.writeInt(u32, file[56..60], 1, .big); // refcount_table_clusters
+
+    std.mem.writeInt(u64, file[@intCast(l1_offset)..][0..8], l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(l2_offset)..][0..8], data_offset, .big);
+    for (file[@intCast(data_offset)..][0..cs], 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251);
+    std.mem.writeInt(u64, file[@intCast(rt_offset)..][0..8], rb_offset, .big);
+
+    // 16-bit refcounts: clusters 0-2 (header/L1/L2), 4 (refcount table), 5
+    // (refcount block) are correctly 1; cluster 3 (the data cluster) is
+    // whatever the test wants to check.
+    inline for (.{ 0, 1, 2, 4, 5 }) |idx| {
+        std.mem.writeInt(u16, file[@intCast(rb_offset + idx * 2)..][0..2], 1, .big);
+    }
+    std.mem.writeInt(u16, file[@intCast(rb_offset + 3 * 2)..][0..2], data_refcount, .big);
+
+    const out_file = try dir.createFile(io, path, .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+}
+
+test "check(): detects a used cluster with stored refcount 0" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildCheckFixture(a, io, tmp.dir, "check-zero.qcow2", 0);
+
+    var img = try Image.open(a, io, tmp.dir, "check-zero.qcow2");
+    defer img.close();
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(!report.isClean());
+    try std.testing.expectEqual(@as(usize, 1), report.findings.items.len);
+    const f = report.findings.items[0];
+    try std.testing.expectEqual(Finding.Kind.used_cluster_zero_refcount, f.kind);
+    try std.testing.expectEqual(@as(u64, 3), f.cluster_index);
+}
+
+test "check(): detects a refcount mismatch" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try buildCheckFixture(a, io, tmp.dir, "check-mismatch.qcow2", 3);
+
+    var img = try Image.open(a, io, tmp.dir, "check-mismatch.qcow2");
+    defer img.close();
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(!report.isClean());
+    try std.testing.expectEqual(@as(usize, 1), report.findings.items.len);
+    const f = report.findings.items[0];
+    try std.testing.expectEqual(Finding.Kind.refcount_mismatch, f.kind);
+    try std.testing.expectEqual(@as(u64, 3), f.cluster_index);
+    try std.testing.expectEqual(@as(u64, 3), f.stored);
+    try std.testing.expectEqual(@as(u64, 1), f.computed);
+}
+
+test "check(): detects a leaked cluster" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Correct data-cluster refcount (1), but extend the file with one extra
+    // unreferenced cluster (6) that the refcount block still marks as
+    // refcount 1 -- a leak nothing in L1/L2/refcount-table metadata points to.
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+    try buildCheckFixture(a, io, tmp.dir, "check-leak.qcow2", 1);
+
+    {
+        const f = try tmp.dir.openFile(io, "check-leak.qcow2", .{ .mode = .read_write });
+        defer f.close(io);
+        var extra: [16384]u8 = @splat(0);
+        try f.writePositionalAll(io, &extra, 6 * cs);
+        // Refcount block (cluster 5) entry for cluster 6 = 1, but nothing
+        // references cluster 6.
+        var rb6: [2]u8 = undefined;
+        std.mem.writeInt(u16, &rb6, 1, .big);
+        try f.writePositionalAll(io, &rb6, 5 * cs + 6 * 2);
+    }
+
+    var img = try Image.open(a, io, tmp.dir, "check-leak.qcow2");
+    defer img.close();
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(!report.isClean());
+    try std.testing.expectEqual(@as(usize, 1), report.findings.items.len);
+    const f = report.findings.items[0];
+    try std.testing.expectEqual(Finding.Kind.leaked_cluster, f.kind);
+    try std.testing.expectEqual(@as(u64, 6), f.cluster_index);
+    try std.testing.expectEqual(@as(u64, 1), f.stored);
+}
+
+test "check(): a backing-file name inside the header cluster isn't double-counted" {
+    // Regression test: the header cluster and a backing-file name that lives
+    // in the same cluster used to each be marked as an independent
+    // reference, making check() report a spurious "refcount 1 but 2
+    // references were found" mismatch on cluster 0 for any image with a
+    // small backing-file name (the common case).
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A trivial backing image; content doesn't matter for this test.
+    const backing_data = [_]u8{0} ** 512;
+    try writer.createFromRaw(a, io, tmp.dir, "backing.qcow2", &backing_data, backing_data.len, .{});
+
+    const cluster_bits: u32 = 14;
+    const cs: u64 = @as(u64, 1) << cluster_bits;
+
+    const file = try a.alloc(u8, 6 * cs);
+    defer a.free(file);
+    @memset(file, 0);
+
+    const l1_offset = 1 * cs;
+    const l2_offset = 2 * cs;
+    const data_offset = 3 * cs;
+    const rt_offset = 4 * cs;
+    const rb_offset = 5 * cs;
+
+    const backing_name = "backing.qcow2";
+    const backing_name_offset: u64 = 512; // well clear of the 104-byte header
+    @memcpy(file[@intCast(backing_name_offset)..][0..backing_name.len], backing_name);
+
+    writeV3ImageHeader(file[0..104], .{
+        .cluster_bits = cluster_bits,
+        .size = cs,
+        .l1_size = 1,
+        .l1_table_offset = l1_offset,
+        .refcount_table_offset = rt_offset,
+        .refcount_order = 4,
+        .backing_file_offset = backing_name_offset,
+        .backing_file_size = @intCast(backing_name.len),
+    });
+    std.mem.writeInt(u32, file[56..60], 1, .big); // refcount_table_clusters
+
+    std.mem.writeInt(u64, file[@intCast(l1_offset)..][0..8], l2_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(l2_offset)..][0..8], data_offset, .big);
+    std.mem.writeInt(u64, file[@intCast(rt_offset)..][0..8], rb_offset, .big);
+    inline for (.{ 0, 1, 2, 3, 4, 5 }) |idx| {
+        std.mem.writeInt(u16, file[@intCast(rb_offset + idx * 2)..][0..2], 1, .big);
+    }
+
+    const out_file = try tmp.dir.createFile(io, "check-backing-name.qcow2", .{ .truncate = true });
+    defer out_file.close(io);
+    try out_file.writePositionalAll(io, file, 0);
+
+    var img = try Image.open(a, io, tmp.dir, "check-backing-name.qcow2");
+    defer img.close();
+    try std.testing.expect(img.backing != null);
+
+    var report = try img.check(a);
+    defer report.deinit(a);
+    try std.testing.expect(report.isClean());
+}
+
+
+

@@ -3,8 +3,11 @@
 # Cross-validate the native Zig qcow2 reader against a real qemu-img/qemu-io
 # build. Creates a handful of qcow2 images (including Extended L2 images with
 # mixed allocated/zero/unallocated subclusters, and an Extended L2 image with
-# a backing-file chain) using the real tools, then compares `qcow2 read`
-# output byte-for-byte (via cmp) against `qemu-img convert -O raw` output.
+# a backing-file chain) using the real tools, then:
+#   - compares `qcow2 read` output byte-for-byte (via cmp) against
+#     `qemu-img convert -O raw` output, and
+#   - compares `qcow2 check`'s clean/dirty verdict against real
+#     `qemu-img check` on the same images.
 #
 # Usage: cross-validate.sh <qemu-build-dir> <qcow2-cli>
 #   <qemu-build-dir>  directory containing the qemu-img and qemu-io binaries
@@ -49,10 +52,28 @@ check() {
     fi
 }
 
+# check_consistency() <name> <qcow2-image>
+# Runs both `qemu-img check` and `qcow2 check` on `<qcow2-image>` and
+# requires them to agree that the image is clean (exit 0 / "no errors").
+check_consistency() {
+    local name="$1" img="$2"
+    local qemu_ok=1 qcow2_ok=1
+    "$QEMU_IMG" check "$img" >"$name.qemu-img-check.log" 2>&1 || qemu_ok=0
+    "$QCOW2" check "$img" >"$name.qcow2-check.log" 2>&1 || qcow2_ok=0
+    if [[ "$qemu_ok" -eq 1 && "$qcow2_ok" -eq 1 ]]; then
+        echo "PASS: $name (check)"
+    else
+        echo "FAIL: $name (check) -- qemu-img check ok=$qemu_ok, qcow2 check ok=$qcow2_ok" >&2
+        cat "$name.qemu-img-check.log" "$name.qcow2-check.log" >&2
+        fail=1
+    fi
+}
+
 echo "== plain v3 image =="
 "$QEMU_IMG" create -f qcow2 plain.qcow2 2M >/dev/null
 "$QEMU_IO" -c "write -P 0x42 0 1048576" plain.qcow2 >/dev/null
 check plain plain.qcow2 2097152
+check_consistency plain plain.qcow2
 
 echo "== Extended L2: mixed allocated / zero / unallocated subclusters =="
 "$QEMU_IMG" create -f qcow2 -o extended_l2=on,cluster_size=64k ext.qcow2 4M >/dev/null
@@ -62,6 +83,7 @@ head -c 2048 /dev/urandom > pat5.bin
 "$QEMU_IO" -c "write -z 4096 2048" ext.qcow2 >/dev/null            # subcluster 2: explicit zero
 "$QEMU_IO" -c "write -s pat5.bin 10240 2048" ext.qcow2 >/dev/null  # subcluster 5: allocated
 check ext-l2 ext.qcow2 4194304
+check_consistency ext-l2 ext.qcow2
 
 echo "== Extended L2 + backing-file chain =="
 "$QEMU_IMG" create -f qcow2 backing.qcow2 2M >/dev/null
@@ -69,6 +91,8 @@ echo "== Extended L2 + backing-file chain =="
 "$QEMU_IMG" create -f qcow2 -o extended_l2=on,cluster_size=64k -F qcow2 -b backing.qcow2 overlay.qcow2 >/dev/null
 "$QEMU_IO" -c "write -P 0xAA 0 2048" overlay.qcow2 >/dev/null
 check ext-l2-backing overlay.qcow2 2097152
+check_consistency backing backing.qcow2
+check_consistency ext-l2-backing overlay.qcow2
 
 if [[ "$fail" -ne 0 ]]; then
     echo "cross-validation FAILED" >&2
