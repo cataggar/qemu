@@ -107,4 +107,13 @@ fn mapCmd(out: *Io.Writer, img: *qcow2.Image, off: u64) !void {
         .compressed => |ref| try out.print("compressed @ 0x{x} ({d} bytes)\n", .{ ref.coffset, ref.csize }),
         .standard => |host| try out.print("standard @ host offset 0x{x}\n", .{host}),
     }
+
+    // Extended L2 images resolve standard/zero/unallocated status per
+    // subcluster (compressed clusters have no subclusters); report which
+    // subcluster this offset falls in.
+    const h = img.header;
+    if (h.hasIncompatible(.extended_l2) and std.meta.activeTag(m) != .compressed) {
+        const index = (off % h.clusterSize()) / h.subclusterSize();
+        try out.print("subcluster:         {d} of {d}\n", .{ index, qcow2.Header.subclusters_per_cluster });
+    }
 }
