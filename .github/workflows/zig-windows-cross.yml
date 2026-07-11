@@ -92,17 +92,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ninja-build pkg-config python3 python3-pip python3-venv \
-            binutils-mingw-w64-x86-64 mingw-w64-x86-64-dev
-          # mingw-w64-x86-64-dev provides only headers/import libs (under
-          # /usr/x86_64-w64-mingw32/include, no compiler) -- needed because
-          # x86_64-w64-mingw32-windres is a real GNU tool (not zig) that
-          # preprocesses version.rc against the *system* mingw sysroot's
-          # headers (winver.h etc.), not zig's own bundled ones. The actual
-          # C/C++ compilation below still uses only zig cc's bundled
-          # mingw-w64 headers/libs (plus our own pathcch/synchronization
-          # import libs), so this doesn't reintroduce a full external
-          # glib2/pixman toolchain -- it's the Windows-headers analogue of
-          # linux-libc-dev for a Linux cross build.
+            binutils-mingw-w64-x86-64
           # meson >=1.5.0 is required; ubuntu-latest's apt package is
           # often older, so install a current one with pip instead.
           pip install --user 'meson>=1.5.0'
