@@ -18,6 +18,12 @@
 #     whenever the C compiler isn't MSVC/clang-cl -- see meson's
 #     mesonbuild/modules/windows.py:_find_resource_compiler). This is a
 #     generic binutils cross-tools package, not a prebuilt Windows glib2/
+#   - mingw-w64-x86-64-dev (apt), headers/import-libs only (no compiler),
+#     since the real windres above preprocesses version.rc against the
+#     system mingw sysroot's own headers (winver.h etc.) rather than zig's
+#     bundled ones. Actual C/C++ compilation still uses only zig cc's
+#     bundled mingw-w64 headers/libs (plus our own pathcch/synchronization
+#     import libs below).
 #     pixman package, so it does not reintroduce the MSYS2/vcpkg dependency
 #     issue #17 is about.
 #   - Sibling checkouts of the `zig16` branch of:
