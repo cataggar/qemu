@@ -120,6 +120,17 @@ export PKG_CONFIG_LIBDIR="$PC_DIR"
 # make it resolve glib-2.0/pixman-1/zlib to our Windows .pc files.
 export PKG_CONFIG=pkg-config
 
+# x86_64-w64-mingw32-windres (a real GNU tool, unlike our C/C++ compiler)
+# preprocesses version.rc and doesn't reliably default to searching the
+# system mingw sysroot's own headers (winver.h etc., from
+# mingw-w64-x86-64-dev) on Ubuntu's packaging -- pass it explicitly.
+# configure/meson tokenizes a space-separated WINDRES value into a
+# proper argv list for the generated cross file (same mechanism already
+# relied on for --cc="zig cc -target ...").
+if [ -d /usr/x86_64-w64-mingw32/include ]; then
+  export WINDRES="${CROSS_PREFIX}windres -I/usr/x86_64-w64-mingw32/include"
+fi
+
 # zig's bundled mingw-w64 subset doesn't include the libpathcch.a/
 # libsynchronization.a friendly-name import-lib aliases that QEMU's
 # meson.build hard-requires on Windows (cc.find_library('pathcch',
