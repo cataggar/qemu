@@ -1,0 +1,517 @@
+name: Release
+
+# Builds qemu-img/qemu-io (and, for Windows, qemu-system-x86_64 with WHPX
+# hardware-acceleration support) with `zig cc` from a chosen commit of
+# cataggar/qemu and publishes them as a GitHub Release.
+#
+# This is the zig16-branch counterpart of the `ghr`-branch release.yml.
+# The Linux/macOS jobs are unchanged (native builds, native package
+# managers for glib2/pixman). The Windows job is replaced entirely: instead
+# of a native windows-latest runner + MSYS2 (see the ghr-branch version),
+# it does a *true cross-compile* from an ubuntu-latest runner using our own
+# zig-built glib/pixman/libiconv/gettext/zlib/nettle (see
+# https://github.com/cataggar/qemu/issues/17 and #20) -- no MSYS2, no
+# vcpkg, no native Windows runner at all. It also builds
+# qemu-system-x86_64.exe with WHPX acceleration in addition to the two
+# tools, since that's now cross-compilable too (issue #20); manually
+# verified to boot real guest code under `-accel whpx` on real Windows
+# hardware (see issue #20's writeup -- GitHub-hosted Windows runners don't
+# support nested virtualization, so this can't be runtime-tested in CI).
+on:
+  workflow_dispatch:
+    inputs:
+      qemu_ref:
+        description: >-
+          Commit-ish (branch, tag, or SHA) in cataggar/qemu to build.
+          Defaults to the latest commit on zig16.
+        required: false
+        default: zig16
+      version:
+        description: 'Release tag to create, e.g. v2026.07.09'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          # Native build (not cross-compiled): zig cc as the compiler, but
+          # dependencies (glib2/pixman) come from Homebrew. True
+          # cross-compilation to macOS from Linux isn't covered by this
+          # branch's work (see issue #17); only Windows is (see the
+          # separate build-windows-cross job below).
+          - os: macos-latest
+            name: macos-arm64
+            experimental: true
+    outputs:
+      qemu_sha: ${{ steps.resolve.outputs.commit }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout QEMU (${{ inputs.qemu_ref }})
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/qemu
+          ref: ${{ inputs.qemu_ref }}
+          fetch-depth: 0
+
+      - name: Record resolved commit
+        id: resolve
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        # Package list is QEMU's own documented minimal build environment,
+        # see docs/devel/build-environment.rst (qemu-minimal.yml via lcitool).
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            bash bc bison bzip2 ca-certificates ccache findutils flex gcc git \
+            libc6-dev libfdt-dev libffi-dev libglib2.0-dev libpixman-1-dev \
+            locales make ninja-build pkgconf python3 python3-venv sed tar
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        # Same minimal set as Linux, via Homebrew. bison/flex explicitly
+        # pulled in: macOS ships an old BSD bison incompatible with QEMU's
+        # build (even just for `configure`, via the hexagon target parser).
+        run: |
+          brew update
+          brew install bison flex glib pixman pkg-config ninja meson
+
+      - name: Install zig cc via ghr
+        uses: cataggar/ghr/actions/install@v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build qemu-img/qemu-io with zig cc (Linux)
+        if: runner.os == 'Linux'
+        # Mirrors scripts/build-with-zig-cc.sh on the zig16 branch (inlined
+        # here so this works against any qemu_ref, including commits that
+        # predate that script), but only builds the two tool binaries this
+        # release packages instead of the full `ninja` (all targets) build.
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            aarch64|arm64) ASM_ARCH=asm-arm64 ;;
+            x86_64|amd64)  ASM_ARCH=asm-x86 ;;
+            *) echo "unsupported host arch $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          BUILD_DIR="$PWD/build-zig"
+          mkdir -p "$BUILD_DIR"
+
+          # Real copy of linux-headers at a distinct path (zig cc ranks
+          # -isystem below /usr/include and de-dups a path given as both
+          # -I and -isystem down to the lower-priority slot).
+          HDR_COPY="$BUILD_DIR/zig-linux-headers-copy"
+          rm -rf "$HDR_COPY"
+          cp -r linux-headers "$HDR_COPY"
+          ln -sfn "$ASM_ARCH" "$HDR_COPY/asm"
+
+          EXTRA_FLAGS="-UNDEBUG -I$HDR_COPY"
+
+          cd "$BUILD_DIR"
+          ../configure \
+            --cc="zig cc" \
+            --cxx="zig c++" \
+            --disable-werror \
+            --disable-plugins \
+            --enable-strip \
+            --extra-cflags="$EXTRA_FLAGS" \
+            --extra-cxxflags="$EXTRA_FLAGS"
+          ninja qemu-img qemu-io
+
+      - name: Build qemu-img/qemu-io with zig cc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          # bison/flex are keg-only on macOS (Homebrew won't symlink them
+          # into PATH since macOS ships its own, incompatible versions).
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+
+          BUILD_DIR="$PWD/build-zig"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          ../configure \
+            --cc="zig cc" \
+            --cxx="zig c++" \
+            --disable-werror \
+            --disable-plugins \
+            --enable-strip \
+            --extra-cflags="-UNDEBUG" \
+            --extra-cxxflags="-UNDEBUG"
+          ninja qemu-img qemu-io
+
+      - name: Verify binaries
+        run: |
+          ./build-zig/qemu-img --version
+          ./build-zig/qemu-io --version
+
+      - name: Package
+        run: |
+          PKGNAME="qemu-tools-zig-cc-${{ inputs.version }}-${{ matrix.name }}"
+          mkdir -p "$PKGNAME"
+          cp build-zig/qemu-img build-zig/qemu-io "$PKGNAME/"
+          cp COPYING "$PKGNAME/" 2>/dev/null || true
+          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.name }}
+          path: qemu-tools-zig-cc-*.tar.gz
+
+  build-windows-cross:
+    name: Build (windows-x64, cross-compile)
+    runs-on: ubuntu-latest
+    # Stretch goal, like this branch's zig-windows-cross.yml /
+    # zig-windows-system-cross.yml: not yet promoted to a required check.
+    continue-on-error: true
+    steps:
+      - name: Checkout QEMU (${{ inputs.qemu_ref }})
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/qemu
+          ref: ${{ inputs.qemu_ref }}
+          fetch-depth: 0
+          path: qemu
+
+      # Sibling checkouts of the zig-built dependencies (see issues #17/#20
+      # for how each was built and verified). Pinned to their own zig16
+      # branches regardless of qemu_ref: these are independent of the QEMU
+      # source tree being built.
+      - name: Checkout pixman
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/pixman
+          ref: zig16
+          path: pixman
+
+      - name: Checkout glib
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/glib
+          ref: zig16
+          path: glib
+
+      - name: Checkout libiconv
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/libiconv
+          ref: zig16
+          path: libiconv
+
+      - name: Checkout gettext
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/gettext
+          ref: zig16
+          path: gettext
+
+      - name: Checkout zlib
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/zlib
+          ref: zig16
+          path: zlib
+
+      - name: Checkout nettle
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/nettle
+          ref: zig16
+          path: nettle
+
+      - name: Install zig cc via ghr
+        uses: cataggar/ghr/actions/install@v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config python3 python3-pip python3-venv \
+            binutils-mingw-w64-x86-64 gcc g++
+          pip install --user 'meson>=1.5.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build qemu-img.exe/qemu-io.exe/qemu-system-x86_64.exe with zig cc
+        # Everything below is inlined (not scripts/build-with-zig-cc-windows*.sh
+        # from the checked-out qemu_ref) so this works against any qemu_ref,
+        # including commits that predate those scripts -- same rationale as
+        # the Linux/macOS jobs' inlined build steps above. See
+        # scripts/build-with-zig-cc-windows-system.sh on this repo's zig16
+        # branch for the (documented, currently-in-sync) non-release version
+        # of this same build, and https://github.com/cataggar/qemu/issues/20
+        # for the full rationale behind each workaround below.
+        run: |
+          set -euo pipefail
+
+          ZIG_TARGET=x86_64-windows-gnu
+          CROSS_PREFIX=x86_64-w64-mingw32-
+          DEPS_DIR="$PWD"
+          SRC_DIR="$PWD/qemu"
+          BUILD_DIR="$PWD/build-zig-windows"
+
+          for dep in pixman glib libiconv gettext zlib nettle; do
+            echo "== building $dep for $ZIG_TARGET =="
+            ( cd "$DEPS_DIR/$dep" && zig build -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseFast )
+          done
+
+          mkdir -p "$BUILD_DIR/pkgconfig"
+          PC_DIR="$BUILD_DIR/pkgconfig"
+
+          write_pc() {
+            local name="$1" version="$2" cflags="$3" libs="$4" vars="${5:-}"
+            { [ -n "$vars" ] && printf '%s\n' "$vars"
+              cat <<EOF
+          Name: $name
+          Description: zig cc build of $name for $ZIG_TARGET
+          Version: $version
+          Cflags: $cflags
+          Libs: $libs
+          EOF
+            } > "$PC_DIR/$name.pc"
+          }
+
+          write_pc zlib 1.3.2 \
+            "-I$DEPS_DIR/zlib/zig-out/include" \
+            "-L$DEPS_DIR/zlib/zig-out/lib -lz"
+
+          write_pc pixman-1 0.46.5 \
+            "-I$DEPS_DIR/pixman/zig-out/include/pixman-1" \
+            "-L$DEPS_DIR/pixman/zig-out/lib -lpixman-1"
+
+          write_pc glib-2.0 2.89.1 \
+            "-I$DEPS_DIR/glib/zig-out/include" \
+            "-L$DEPS_DIR/glib/zig-out/lib -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32" \
+            "prefix=$DEPS_DIR/glib/zig-out
+          bindir=\${prefix}/bin"
+
+          write_pc nettle 4.0 \
+            "-I$DEPS_DIR/nettle/zig-out/include" \
+            "-L$DEPS_DIR/nettle/zig-out/lib -lnettle"
+
+          export PKG_CONFIG_PATH="$PC_DIR"
+          export PKG_CONFIG_LIBDIR="$PC_DIR"
+          export PKG_CONFIG=pkg-config
+
+          # zig's bundled mingw-w64 subset doesn't include the libpathcch.a/
+          # libsynchronization.a friendly-name import-lib aliases meson.build
+          # hard-requires on Windows, only the underlying real Microsoft
+          # api-ms-win-*.def files. Synthesize the two aliases with `zig
+          # dlltool`. (See scripts/zig-cc-windows-defs/*.def on this repo's
+          # zig16 branch for the same content, with fuller rationale
+          # comments -- inlined here rather than read from the checkout.)
+          DEFS_DIR="$BUILD_DIR/defs"
+          mkdir -p "$DEFS_DIR"
+
+          cat > "$DEFS_DIR/pathcch.def" <<'EOF'
+          LIBRARY api-ms-win-core-path-l1-1-0
+          EXPORTS
+          PathAllocCanonicalize
+          PathAllocCombine
+          PathCchAddBackslash
+          PathCchAddBackslashEx
+          PathCchAddExtension
+          PathCchAppend
+          PathCchAppendEx
+          PathCchCanonicalize
+          PathCchCanonicalizeEx
+          PathCchCombine
+          PathCchCombineEx
+          PathCchFindExtension
+          PathCchIsRoot
+          PathCchRemoveBackslash
+          PathCchRemoveBackslashEx
+          PathCchRemoveExtension
+          PathCchRemoveFileSpec
+          PathCchRenameExtension
+          PathCchSkipRoot
+          PathCchStripPrefix
+          PathCchStripToRoot
+          PathIsUNCEx
+          EOF
+
+          cat > "$DEFS_DIR/synchronization.def" <<'EOF'
+          LIBRARY api-ms-win-core-synch-l1-2-0
+          EXPORTS
+          DeleteSynchronizationBarrier
+          EnterSynchronizationBarrier
+          InitializeConditionVariable
+          InitializeSynchronizationBarrier
+          InitOnceBeginInitialize
+          InitOnceComplete
+          InitOnceExecuteOnce
+          InitOnceInitialize
+          SignalObjectAndWait
+          Sleep
+          SleepConditionVariableCS
+          SleepConditionVariableSRW
+          WaitOnAddress
+          WakeAllConditionVariable
+          WakeByAddressAll
+          WakeByAddressSingle
+          WakeConditionVariable
+          EOF
+
+          IMPLIB_DIR="$BUILD_DIR/windows-import-libs"
+          mkdir -p "$IMPLIB_DIR"
+          zig dlltool -d "$DEFS_DIR/pathcch.def" -l "$IMPLIB_DIR/libpathcch.a" -m i386:x86-64
+          zig dlltool -d "$DEFS_DIR/synchronization.def" -l "$IMPLIB_DIR/libsynchronization.a" -m i386:x86-64
+
+          # x86_64-w64-mingw32-windres (real GNU tool) shells out to
+          # "${cross_prefix}gcc" to preprocess version.rc, which doesn't
+          # exist here (only binutils-mingw-w64-x86-64 installed, no
+          # gcc-mingw-w64). Use `zig cc -E` instead. `-x c`: zig cc doesn't
+          # recognize the .rc extension as C source. `-include
+          # winapifamily.h`: version.rc includes <winver.h> directly rather
+          # than <windows.h>, which normally pulls in winapifamily.h first.
+          cat > "$DEFS_DIR/rc-preprocessor.sh" <<EOF
+          #!/bin/sh
+          exec zig cc -target $ZIG_TARGET -E -x c -include winapifamily.h "\$@"
+          EOF
+          chmod +x "$DEFS_DIR/rc-preprocessor.sh"
+          export WINDRES="${CROSS_PREFIX}windres --preprocessor=$DEFS_DIR/rc-preprocessor.sh"
+
+          # The Windows+clang "needs lld" linker-id check only makes sense
+          # for plugin support (delaylib), per its own comment, but
+          # (depending on qemu_ref) may still be enforced unconditionally.
+          # zig cc always links with its own bundled lld but reports a
+          # linker id of 'ld.zigcc' rather than 'ld.lld', tripping this
+          # check even with --disable-plugins. Gate it on plugins (a no-op,
+          # if qemu_ref already has this fix committed).
+          sed -i "s/compiler.get_linker_id() != 'ld.lld'/compiler.get_linker_id() != 'ld.lld' and get_option('plugins')/" "$SRC_DIR/meson.build"
+
+          # -DGLIB_STATIC_COMPILATION: without it, glib's headers declare
+          # functions with __declspec(dllimport) (glib assumes a shared
+          # DLL), and lld-link refuses to resolve those against our plain
+          # static glib-2.0.lib. See cataggar/qemu#20 for the full
+          # rationale, including why --static isn't used instead.
+          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION"
+          EXTRA_LDFLAGS="-L$IMPLIB_DIR"
+
+          cd "$BUILD_DIR"
+          "$SRC_DIR/configure" \
+              --cross-prefix="$CROSS_PREFIX" \
+              --cc="zig cc -target $ZIG_TARGET" \
+              --cxx="zig c++ -target $ZIG_TARGET" \
+              --target-list=x86_64-softmmu \
+              --enable-tools \
+              --enable-whpx \
+              --enable-nettle \
+              --disable-gcrypt \
+              --disable-gnutls \
+              --disable-sdl \
+              --disable-gtk \
+              --disable-vnc \
+              --disable-opengl \
+              --disable-virglrenderer \
+              --disable-dbus-display \
+              --disable-guest-agent \
+              --disable-werror \
+              --disable-plugins \
+              --disable-curses \
+              --disable-brlapi \
+              --disable-spice \
+              --disable-usb-redir \
+              --disable-install-blobs \
+              --enable-strip \
+              --extra-cflags="$EXTRA_FLAGS" \
+              --extra-cxxflags="$EXTRA_FLAGS" \
+              --extra-ldflags="$EXTRA_LDFLAGS"
+
+          ninja qemu-img.exe qemu-io.exe qemu-system-x86_64.exe
+
+      - name: Verify binaries
+        # Cross-compiled *for* Windows, built *on* Linux -- can't execute
+        # these here (no Windows runner, no Wine), so just confirm each is
+        # a real PE32+ executable. See cataggar/qemu#20 for how these were
+        # actually run and boot-tested, manually, on real Windows hardware.
+        working-directory: build-zig-windows
+        run: file qemu-img.exe qemu-io.exe qemu-system-x86_64.exe | tee /dev/stderr | grep -c 'PE32+ executable' | grep -q '^3$'
+
+      - name: Package
+        run: |
+          PKGNAME="qemu-tools-zig-cc-${{ inputs.version }}-windows-x64"
+          mkdir -p "$PKGNAME"
+          cp build-zig-windows/qemu-img.exe build-zig-windows/qemu-io.exe build-zig-windows/qemu-system-x86_64.exe "$PKGNAME/"
+          # pc-bios/ (SeaBIOS, VGA BIOS, etc.) is required at runtime for
+          # qemu-system-x86_64.exe to actually boot anything -- see
+          # cataggar/qemu#20's manual verification, which hit exactly this.
+          cp -r qemu/pc-bios "$PKGNAME/"
+          cp qemu/COPYING "$PKGNAME/" 2>/dev/null || true
+          zip -r "$PKGNAME.zip" "$PKGNAME"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-x64
+          path: qemu-tools-zig-cc-*.zip
+
+  release:
+    name: Create Release
+    needs: [build, build-windows-cross]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          merge-multiple: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        with:
+          subject-path: qemu-tools-zig-cc-*
+
+      - name: Create release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          tag_name: ${{ inputs.version }}
+          target_commitish: ${{ needs.build.outputs.qemu_sha }}
+          name: qemu-tools-zig-cc ${{ inputs.version }}
+          body: |
+            `qemu-img` / `qemu-io` (Linux, macOS, Windows) and, on Windows,
+            `qemu-system-x86_64` with WHPX hardware-acceleration support,
+            built with [`zig cc`](https://ziglang.org/) from
+            [cataggar/qemu@${{ needs.build.outputs.qemu_sha }}](https://github.com/cataggar/qemu/commit/${{ needs.build.outputs.qemu_sha }})
+            (requested ref: `${{ inputs.qemu_ref }}`).
+
+            The Windows package is built by **true cross-compilation from a
+            Linux runner** (no MSYS2, no vcpkg, no native Windows runner) --
+            see https://github.com/cataggar/qemu/issues/17 and
+            https://github.com/cataggar/qemu/issues/20 for the full
+            background, and issue #20 for manual verification that
+            `qemu-system-x86_64.exe` boots real guest code under
+            `-accel whpx` on real Windows hardware.
+
+            Installable with [ghr](https://cataggar.github.io/ghr/):
+
+            ```
+            ghr install cataggar/qemu@${{ inputs.version }}
+            ```
+          files: qemu-tools-zig-cc-*
+          draft: false
+          prerelease: false
