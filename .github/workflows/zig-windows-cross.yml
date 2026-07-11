@@ -1,0 +1,107 @@
+name: zig-windows-cross
+
+# True cross-compilation of qemu-img.exe/qemu-io.exe for Windows
+# (x86_64-windows-gnu) from an ubuntu-latest runner using `zig cc`/`zig c++`
+# plus our own zig-built glib/pixman/libiconv/gettext/zlib -- no MSYS2, no
+# vcpkg, no native windows-latest runner. See
+# https://github.com/cataggar/qemu/issues/17 for the background: QEMU
+# hard-requires glib2 and pixman even for the tools-only qemu-img/qemu-io
+# targets, and there's no cross-compiled Windows build of them available
+# via a simple `apt-get install`.
+on:
+  push:
+    branches: [zig16]
+    paths:
+      - 'scripts/build-with-zig-cc-windows.sh'
+      - 'scripts/zig-cc-windows-defs/**'
+      - '.github/workflows/zig-windows-cross.yml'
+  pull_request:
+    paths:
+      - 'scripts/build-with-zig-cc-windows.sh'
+      - 'scripts/zig-cc-windows-defs/**'
+      - '.github/workflows/zig-windows-cross.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    # Stretch goal, like zig-qcow2.yml's "integration" job: not yet
+    # promoted to a required check, so it doesn't block merges while this
+    # (much larger than qcow2) build-dependency chain is proven out across
+    # real runs.
+    name: Build qemu-img.exe / qemu-io.exe
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout qemu
+        uses: actions/checkout@v4
+        with:
+          path: qemu
+
+      # Sibling checkouts expected by scripts/build-with-zig-cc-windows.sh
+      # (as ../pixman, ../glib, ../libiconv, ../gettext, ../zlib relative
+      # to the qemu checkout). Each is a real upstream source tree plus a
+      # hand-written build.zig/build.zig.zon, built and verified
+      # independently (see each repo's own zig16 branch / README history).
+      - name: Checkout pixman
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/pixman
+          ref: zig16
+          path: pixman
+
+      - name: Checkout glib
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/glib
+          ref: zig16
+          path: glib
+
+      - name: Checkout libiconv
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/libiconv
+          ref: zig16
+          path: libiconv
+
+      - name: Checkout gettext
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/gettext
+          ref: zig16
+          path: gettext
+
+      - name: Checkout zlib
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/zlib
+          ref: zig16
+          path: zlib
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config python3 python3-pip python3-venv \
+            binutils-mingw-w64-x86-64
+          # meson >=1.5.0 is required; ubuntu-latest's apt package is
+          # often older, so install a current one with pip instead.
+          pip install --user 'meson>=1.5.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build qemu-img.exe / qemu-io.exe with zig cc
+        working-directory: qemu
+        run: scripts/build-with-zig-cc-windows.sh build-zig-windows
+
+      - name: Check binaries
+        working-directory: qemu/build-zig-windows
+        run: file qemu-img.exe qemu-io.exe | tee /dev/stderr | grep -q 'PE32+ executable'

@@ -1,0 +1,35 @@
+;
+; Minimal .def file for the Windows synchronization APIs QEMU's
+; include/qemu/futex.h uses (WaitOnAddress/WakeByAddressSingle/
+; WakeByAddressAll), used to synthesize a libsynchronization.a import
+; library with `zig dlltool` when cross-compiling for Windows with
+; `zig cc` (see scripts/build-with-zig-cc-windows.sh).
+;
+; Same rationale as pathcch.def in this directory: zig's bundled
+; mingw-w64 subset ships the underlying API-set forwarder DLL's own
+; .def file (lib/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def,
+; symbol list copied verbatim below) but not the "libsynchronization.a"
+; friendly-name alias QEMU's meson.build looks up via
+; `cc.find_library('synchronization', required: true)`.
+;
+LIBRARY api-ms-win-core-synch-l1-2-0
+
+EXPORTS
+
+DeleteSynchronizationBarrier
+EnterSynchronizationBarrier
+InitializeConditionVariable
+InitializeSynchronizationBarrier
+InitOnceBeginInitialize
+InitOnceComplete
+InitOnceExecuteOnce
+InitOnceInitialize
+SignalObjectAndWait
+Sleep
+SleepConditionVariableCS
+SleepConditionVariableSRW
+WaitOnAddress
+WakeAllConditionVariable
+WakeByAddressAll
+WakeByAddressSingle
+WakeConditionVariable
