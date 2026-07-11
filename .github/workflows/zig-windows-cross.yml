@@ -105,3 +105,12 @@ jobs:
       - name: Check binaries
         working-directory: qemu/build-zig-windows
         run: file qemu-img.exe qemu-io.exe | tee /dev/stderr | grep -q 'PE32+ executable'
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-windows-tools
+          path: |
+            qemu/build-zig-windows/qemu-img.exe
+            qemu/build-zig-windows/qemu-io.exe
+          retention-days: 7
