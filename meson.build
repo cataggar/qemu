@@ -374,7 +374,11 @@ elif host_os == 'haiku'
   qemu_common_flags += ['-DB_USE_POSITIVE_POSIX_ERRORS', '-D_BSD_SOURCE', '-fPIC']
 elif host_os == 'windows'
   # plugins use delaylib, and clang needs to be used with lld to make it work.
-  if compiler.get_id() == 'clang' and compiler.get_linker_id() != 'ld.lld'
+  # Only enforce this when plugins are actually enabled: `zig cc` always
+  # links with its own bundled lld, but reports a linker id of 'ld.zigcc'
+  # rather than 'ld.lld', which would otherwise trip this check even
+  # though plugins (the only feature this requires lld for) are disabled.
+  if get_option('plugins') and compiler.get_id() == 'clang' and compiler.get_linker_id() != 'ld.lld'
     error('On windows, you need to use lld with clang - use msys2 clang64/clangarm64 env')
   endif
 endif

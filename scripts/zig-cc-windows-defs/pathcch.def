@@ -1,0 +1,43 @@
+;
+; Minimal .def file for the subset of Windows PathCch* APIs QEMU's
+; util/cutils.c actually calls (PathCchSkipRoot), used to synthesize a
+; libpathcch.a import library with `zig dlltool` when cross-compiling
+; for Windows with `zig cc` (see scripts/build-with-zig-cc-windows.sh).
+;
+; zig's bundled mingw-w64 subset ships the underlying Windows 10+ API-set
+; forwarder DLL's own .def file
+; (lib/libc/mingw/lib-common/api-ms-win-core-path-l1-1-0.def) but not the
+; "libpathcch.a" friendly-name alias that a full mingw-w64 distribution
+; normally provides and that QEMU's meson.build looks up via
+; `cc.find_library('pathcch', required: true)`. This file re-exports the
+; same symbol list (verbatim from that .def) under the "pathcch" name so
+; `-lpathcch` resolves; the real functions are still served at runtime by
+; api-ms-win-core-path-l1-1-0.dll (present on Windows 10+ and forwarded to
+; kernelbase.dll), exactly as a real libpathcch.a would.
+;
+LIBRARY api-ms-win-core-path-l1-1-0
+
+EXPORTS
+
+PathAllocCanonicalize
+PathAllocCombine
+PathCchAddBackslash
+PathCchAddBackslashEx
+PathCchAddExtension
+PathCchAppend
+PathCchAppendEx
+PathCchCanonicalize
+PathCchCanonicalizeEx
+PathCchCombine
+PathCchCombineEx
+PathCchFindExtension
+PathCchIsRoot
+PathCchRemoveBackslash
+PathCchRemoveBackslashEx
+PathCchRemoveExtension
+PathCchRemoveFileSpec
+PathCchRenameExtension
+PathCchSkipRoot
+PathCchStripPrefix
+PathCchStripToRoot
+PathIsUNCEx
