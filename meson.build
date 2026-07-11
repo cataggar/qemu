@@ -3090,10 +3090,10 @@ if have_cpuid_h
   ''')
   have_avx512bw = cc.links('''
     #include <immintrin.h>
-    static int __attribute__((target("avx512bw"))) bar(void *a) {
-      __m512i *x = a;
-      __m512i res= _mm512_abs_epi8(*x);
-      return res[1];
+    static int __attribute__((target("avx512bw,evex512"))) bar(void *a) {
+      __m512i r = _mm512_set1_epi32(0);
+      __m512i x = _mm512_mask_loadu_epi8(r, 0xff, a);
+      return _mm512_cmpeq_epi8_mask(x, r) & 1;
     }
     int main(int argc, char *argv[]) { return bar(argv[0]); }
   ''')

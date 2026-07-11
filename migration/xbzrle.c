@@ -19,7 +19,17 @@
 #include <immintrin.h>
 #include "host/cpuinfo.h"
 
-static int __attribute__((target("avx512bw")))
+/*
+ * `evex512` is required in addition to `avx512bw`: newer clang (19+)
+ * splits out 512-bit EVEX register support as its own target feature
+ * (since not all AVX10/256 hardware supports 512-bit ops), so
+ * intrinsics like _mm512_set1_epi32/_mm512_mask_loadu_epi8 used below
+ * are always_inline functions that require it explicitly, even though
+ * plain "avx512bw" alone still enables the underlying instructions.
+ * GCC 14+ also recognizes "evex512" as a target attribute value. See
+ * the matching have_avx512bw feature-detection snippet in meson.build.
+ */
+static int __attribute__((target("avx512bw,evex512")))
 xbzrle_encode_buffer_avx512(uint8_t *old_buf, uint8_t *new_buf, int slen,
                             uint8_t *dst, int dlen)
 {
