@@ -1,0 +1,130 @@
+name: zig-windows-system-cross
+
+# True cross-compilation of qemu-system-x86_64.exe for Windows
+# (x86_64-windows-gnu) from an ubuntu-latest runner using `zig cc`/`zig c++`,
+# with WHPX (Windows Hypervisor Platform) hardware-acceleration support
+# built in. Follow-up to zig-windows-cross.yml (qemu-img/qemu-io, issue #17)
+# for the actual machine emulator -- see
+# https://github.com/cataggar/qemu/issues/20.
+#
+# Console-only (`-nographic`) for this first pass: SDL/GTK/VNC/OpenGL are
+# all disabled. GitHub-hosted windows-latest runners don't support nested
+# virtualization, so this job only *build*-verifies the cross-compile;
+# WHPX's actual runtime behavior (does a guest really boot and get
+# accelerated) was manually verified on real Windows hardware instead --
+# see issue #20 for that verification.
+on:
+  push:
+    branches: [zig16]
+    paths:
+      - 'scripts/build-with-zig-cc-windows-system.sh'
+      - 'scripts/zig-cc-windows-defs/**'
+      - '.github/workflows/zig-windows-system-cross.yml'
+  pull_request:
+    paths:
+      - 'scripts/build-with-zig-cc-windows-system.sh'
+      - 'scripts/zig-cc-windows-defs/**'
+      - '.github/workflows/zig-windows-system-cross.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    # Stretch goal, like zig-windows-cross.yml: not yet promoted to a
+    # required check, so it doesn't block merges while this (much larger)
+    # build is proven out across real runs.
+    name: Build qemu-system-x86_64.exe
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout qemu
+        uses: actions/checkout@v4
+        with:
+          path: qemu
+
+      # Sibling checkouts expected by
+      # scripts/build-with-zig-cc-windows-system.sh (as ../pixman, ../glib,
+      # ../libiconv, ../gettext, ../zlib, ../nettle relative to the qemu
+      # checkout). Same as zig-windows-cross.yml, plus nettle (needed here
+      # since --target-list=x86_64-softmmu makes have_system=true, pulling
+      # meson.build's crypto backend selection back in).
+      - name: Checkout pixman
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/pixman
+          ref: zig16
+          path: pixman
+
+      - name: Checkout glib
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/glib
+          ref: zig16
+          path: glib
+
+      - name: Checkout libiconv
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/libiconv
+          ref: zig16
+          path: libiconv
+
+      - name: Checkout gettext
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/gettext
+          ref: zig16
+          path: gettext
+
+      - name: Checkout zlib
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/zlib
+          ref: zig16
+          path: zlib
+
+      - name: Checkout nettle
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/nettle
+          ref: zig16
+          path: nettle
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.4
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config python3 python3-pip python3-venv \
+            binutils-mingw-w64-x86-64 gcc g++
+          # gcc/g++: a native (Linux, build-machine) compiler, needed for
+          # a handful of build-time code generators meson runs for the
+          # *build* machine, not the Windows target -- unrelated to the
+          # "no MSYS2/vcpkg" goal, which is about the target toolchain.
+          # meson >=1.5.0 is required; ubuntu-latest's apt package is
+          # often older, so install a current one with pip instead.
+          pip install --user 'meson>=1.5.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build qemu-system-x86_64.exe with zig cc
+        working-directory: qemu
+        run: scripts/build-with-zig-cc-windows-system.sh build-zig-windows-system
+
+      - name: Check binary
+        working-directory: qemu/build-zig-windows-system
+        run: file qemu-system-x86_64.exe | tee /dev/stderr | grep -q 'PE32+ executable'
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-system-windows
+          path: qemu/build-zig-windows-system/qemu-system-x86_64.exe
+          retention-days: 7
