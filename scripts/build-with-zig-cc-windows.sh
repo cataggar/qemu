@@ -18,14 +18,14 @@
 #     whenever the C compiler isn't MSVC/clang-cl -- see meson's
 #     mesonbuild/modules/windows.py:_find_resource_compiler). This is a
 #     generic binutils cross-tools package, not a prebuilt Windows glib2/
+#     pixman package, so it does not reintroduce the MSYS2/vcpkg dependency
+#     issue #17 is about.
 #   - mingw-w64-x86-64-dev (apt), headers/import-libs only (no compiler),
 #     since the real windres above preprocesses version.rc against the
 #     system mingw sysroot's own headers (winver.h etc.) rather than zig's
 #     bundled ones. Actual C/C++ compilation still uses only zig cc's
 #     bundled mingw-w64 headers/libs (plus our own pathcch/synchronization
 #     import libs below).
-#     pixman package, so it does not reintroduce the MSYS2/vcpkg dependency
-#     issue #17 is about.
 #   - Sibling checkouts of the `zig16` branch of:
 #       https://github.com/cataggar/pixman
 #       https://github.com/cataggar/glib
@@ -51,6 +51,7 @@ BUILD_DIR="${1:-$SRC_DIR/build-zig-windows}"
 DEPS_DIR="${QEMU_ZIG_DEPS_DIR:-$(cd "$SRC_DIR/.." && pwd)}"
 
 ZIG_TARGET=x86_64-windows-gnu
+export ZIG_TARGET   # read by scripts/zig-cc-windows-defs/rc-preprocessor.sh
 CROSS_PREFIX=x86_64-w64-mingw32-
 
 DEPS="pixman glib libiconv gettext zlib"
@@ -121,14 +122,22 @@ export PKG_CONFIG_LIBDIR="$PC_DIR"
 export PKG_CONFIG=pkg-config
 
 # x86_64-w64-mingw32-windres (a real GNU tool, unlike our C/C++ compiler)
-# preprocesses version.rc and doesn't reliably default to searching the
-# system mingw sysroot's own headers (winver.h etc., from
-# mingw-w64-x86-64-dev) on Ubuntu's packaging -- pass it explicitly.
-# configure/meson tokenizes a space-separated WINDRES value into a
-# proper argv list for the generated cross file (same mechanism already
-# relied on for --cc="zig cc -target ...").
+# preprocesses version.rc, which needs two things binutils-mingw-w64-x86-64
+# alone doesn't provide:
+#   1. Windows sysroot headers (winver.h etc., from mingw-w64-x86-64-dev)
+#      -- windres doesn't reliably default to searching
+#      /usr/x86_64-w64-mingw32/include on Ubuntu's packaging, so pass it
+#      explicitly with -I.
+#   2. A real C preprocessor: windres shells out to "${cross_prefix}gcc"
+#      by default to expand macros/#includes, which doesn't exist without
+#      gcc-mingw-w64 installed. scripts/zig-cc-windows-defs/rc-preprocessor.sh
+#      is a `zig cc -E` shim used instead, via --preprocessor=.
+# configure/meson tokenizes a space-separated WINDRES value into a proper
+# argv list for the generated cross file (same mechanism already relied
+# on for --cc="zig cc -target ...").
+DEFS_DIR="$SRC_DIR/scripts/zig-cc-windows-defs"
 if [ -d /usr/x86_64-w64-mingw32/include ]; then
-  export WINDRES="${CROSS_PREFIX}windres -I/usr/x86_64-w64-mingw32/include"
+  export WINDRES="${CROSS_PREFIX}windres -I/usr/x86_64-w64-mingw32/include --preprocessor=$DEFS_DIR/rc-preprocessor.sh"
 fi
 
 # zig's bundled mingw-w64 subset doesn't include the libpathcch.a/
@@ -139,7 +148,6 @@ fi
 # scripts/zig-cc-windows-defs/*.def for the full rationale; synthesize
 # those two import libs here with `zig dlltool` (zig's drop-in
 # dlltool.exe) rather than depending on a full mingw-w64 install.
-DEFS_DIR="$SRC_DIR/scripts/zig-cc-windows-defs"
 mkdir -p "$BUILD_DIR/windows-import-libs"
 IMPLIB_DIR="$BUILD_DIR/windows-import-libs"
 zig dlltool -d "$DEFS_DIR/pathcch.def" -l "$IMPLIB_DIR/libpathcch.a" -m i386:x86-64
