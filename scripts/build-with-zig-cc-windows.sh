@@ -106,6 +106,13 @@ bindir=\${prefix}/bin"
 
 export PKG_CONFIG_PATH="$PC_DIR"
 export PKG_CONFIG_LIBDIR="$PC_DIR"
+# QEMU's configure defaults pkg_config to "${cross_prefix}pkg-config"
+# (x86_64-w64-mingw32-pkg-config here), but pkg-config itself is not a
+# per-target binary -- binutils-mingw-w64-x86-64 doesn't ship one under
+# that name, only ar/nm/strip/windres/dlltool/etc. Point it at the plain
+# host pkg-config instead; PKG_CONFIG_PATH/LIBDIR above are what actually
+# make it resolve glib-2.0/pixman-1/zlib to our Windows .pc files.
+export PKG_CONFIG=pkg-config
 
 # zig's bundled mingw-w64 subset doesn't include the libpathcch.a/
 # libsynchronization.a friendly-name import-lib aliases that QEMU's
