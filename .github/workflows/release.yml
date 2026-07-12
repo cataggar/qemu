@@ -168,7 +168,7 @@ jobs:
 
       - name: Package
         run: |
-          PKGNAME="qemu-tools-zig-cc-${{ inputs.version }}-${{ matrix.name }}"
+          PKGNAME="qemu-${{ inputs.version }}-${{ matrix.name }}"
           mkdir -p "$PKGNAME"
           cp build-zig/qemu-img build-zig/qemu-io "$PKGNAME/"
           cp COPYING "$PKGNAME/" 2>/dev/null || true
@@ -178,7 +178,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.name }}
-          path: qemu-tools-zig-cc-*.tar.gz
+          path: qemu-*.tar.gz
 
   build-windows-cross:
     name: Build (windows-x64, cross-compile)
@@ -456,7 +456,7 @@ jobs:
 
       - name: Package
         run: |
-          PKGNAME="qemu-tools-zig-cc-${{ inputs.version }}-windows-x64"
+          PKGNAME="qemu-${{ inputs.version }}-windows-x64"
           mkdir -p "$PKGNAME"
           cp build-zig-windows/qemu-img.exe build-zig-windows/qemu-io.exe build-zig-windows/qemu-system-x86_64.exe "$PKGNAME/"
           # pc-bios/ (SeaBIOS, VGA BIOS, etc.) is required at runtime for
@@ -470,7 +470,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-x64
-          path: qemu-tools-zig-cc-*.zip
+          path: qemu-*.zip
 
   release:
     name: Create Release
@@ -484,14 +484,14 @@ jobs:
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
-          subject-path: qemu-tools-zig-cc-*
+          subject-path: qemu-*
 
       - name: Create release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           tag_name: ${{ inputs.version }}
           target_commitish: ${{ needs.build.outputs.qemu_sha }}
-          name: qemu-tools-zig-cc ${{ inputs.version }}
+          name: qemu ${{ inputs.version }}
           body: |
             `qemu-img` / `qemu-io` (Linux, macOS, Windows) and, on Windows,
             `qemu-system-x86_64` with WHPX hardware-acceleration support,
@@ -512,6 +512,6 @@ jobs:
             ```
             ghr install cataggar/qemu@${{ inputs.version }}
             ```
-          files: qemu-tools-zig-cc-*
+          files: qemu-*
           draft: false
           prerelease: false
