@@ -132,6 +132,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
+            --with-pkgversion="${{ inputs.version }}" \
             --disable-werror \
             --disable-plugins \
             --enable-strip \
@@ -154,6 +155,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
+            --with-pkgversion="${{ inputs.version }}" \
             --disable-werror \
             --disable-plugins \
             --enable-strip \
@@ -419,6 +421,7 @@ jobs:
               --cross-prefix="$CROSS_PREFIX" \
               --cc="zig cc -target $ZIG_TARGET" \
               --cxx="zig c++ -target $ZIG_TARGET" \
+              --with-pkgversion="${{ inputs.version }}" \
               --target-list=x86_64-softmmu \
               --enable-tools \
               --enable-whpx \
@@ -457,12 +460,22 @@ jobs:
       - name: Package
         run: |
           PKGNAME="qemu-${{ inputs.version }}-windows-x64"
-          mkdir -p "$PKGNAME"
+          mkdir -p "$PKGNAME/share"
           cp build-zig-windows/qemu-img.exe build-zig-windows/qemu-io.exe build-zig-windows/qemu-system-x86_64.exe "$PKGNAME/"
-          # pc-bios/ (SeaBIOS, VGA BIOS, etc.) is required at runtime for
-          # qemu-system-x86_64.exe to actually boot anything -- see
-          # cataggar/qemu#20's manual verification, which hit exactly this.
-          cp -r qemu/pc-bios "$PKGNAME/"
+          # QEMU's runtime firmware/data lookup (util/datadir.c,
+          # util/cutils.c's get_relocated_path()) is relocatable: it
+          # resolves relative to the running .exe's own directory. But on
+          # Windows, meson.build sets qemu_suffix/bindir both empty
+          # (configs/meson/windows.txt), so the compiled-in datadir is
+          # just "<prefix>/share" with the .exe directly in "<prefix>"
+          # itself (no "bin/" nesting) -- i.e. .exe and share/ must be
+          # *siblings*, confirmed empirically (see cataggar/qemu#20).
+          # pc-bios/*.bin/*.rom install flat into that datadir (see
+          # pc-bios/meson.build's install_data(blobs, install_dir:
+          # qemu_datadir)), not nested under a "pc-bios/" subdirectory --
+          # so copy its *contents* into share/, not the pc-bios/ dir
+          # itself, or qemu-system-x86_64.exe won't find them by default.
+          cp -r qemu/pc-bios/* "$PKGNAME/share/"
           cp qemu/COPYING "$PKGNAME/" 2>/dev/null || true
           zip -r "$PKGNAME.zip" "$PKGNAME"
 
