@@ -6,17 +6,37 @@ on:
     paths:
       - 'zig/nbd/**'
       - '.github/workflows/zig-nbd.yml'
+  # No `paths:` filter here (unlike push, above): this workflow's `test`
+  # job is a required status check, and a required check whose *workflow*
+  # never runs (due to a top-level paths filter) leaves that check stuck
+  # "Expected" forever, permanently blocking merges for PRs that don't
+  # touch zig/nbd. Instead, the workflow always runs and the `changes` job
+  # below decides -- via job-level `if:` -- whether `test` actually does
+  # anything or reports back as a (non-blocking) "skipped" success.
   pull_request:
-    paths:
-      - 'zig/nbd/**'
-      - '.github/workflows/zig-nbd.yml'
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - 'zig/nbd/**'
+              - '.github/workflows/zig-nbd.yml'
+
   test:
-    name: Build & test
+    name: Build & test (nbd)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
