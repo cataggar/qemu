@@ -268,7 +268,8 @@ jobs:
             --extra-cxxflags="-UNDEBUG"
           ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
 
-      - name: Strip binaries
+      - name: Strip binaries (Linux)
+        if: runner.os == 'Linux'
         # --enable-strip (-Dstrip=true) only strips *on install*
         # (per `meson configure`'s own help text: "Strip targets on
         # install"), but this workflow only ever runs plain `ninja
@@ -280,6 +281,30 @@ jobs:
           strip build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}"
           find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -exec strip {} +
 
+      - name: Strip binaries (macOS)
+        if: runner.os == 'macOS'
+        # Same underlying issue as the Linux Strip binaries step, but on
+        # macOS a plain `strip` isn't enough: Apple Silicon's kernel
+        # refuses to even *launch* a Mach-O binary whose code signature
+        # doesn't match its current bytes (unrelated to
+        # Gatekeeper/notarization -- this is enforced for every binary,
+        # signed ad hoc or not), and `strip` invalidates the signature
+        # meson.build's entitlement.sh already applied without
+        # reapplying one. Re-sign ad hoc after stripping so these still
+        # run; the primary (HVF-accelerated) target additionally needs
+        # its entitlements reapplied, or Hypervisor.framework access is
+        # silently denied even though the binary itself still launches.
+        run: |
+          strip build-zig/qemu-img build-zig/qemu-io
+          codesign -f -s - build-zig/qemu-img build-zig/qemu-io
+          strip "build-zig/${{ matrix.system_bin }}"
+          codesign -f -s - --entitlements accel/hvf/entitlements.plist "build-zig/${{ matrix.system_bin }}"
+          # -unsigned: meson.build builds every macOS target twice --
+          # once as "<name>-unsigned", then signs it into the final
+          # "<name>" -- so exclude the leftover unsigned copies here too.
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' \
+            -exec strip {} \; -exec codesign -f -s - {} \;
+
       - name: Verify binaries
         run: |
           ./build-zig/qemu-img --version
@@ -288,8 +313,11 @@ jobs:
           # -maxdepth 1 -type f: build-zig-other/ also contains meson/ninja
           # build-artifact dirs alongside each binary (e.g.
           # qemu-system-alpha.p/), which the plain qemu-system-* glob used
-          # to match too, causing "$bin: Is a directory" here.
-          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -print0 |
+          # to match too, causing "$bin: Is a directory" here. On macOS,
+          # it also contains a "<name>-unsigned" copy of every target
+          # (see the Strip binaries (macOS) step above) -- exclude those
+          # too, we only want the final signed binary.
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' -print0 |
             while IFS= read -r -d '' bin; do "$bin" --version; done
 
       - name: Package
@@ -298,9 +326,10 @@ jobs:
           mkdir -p "$PKGNAME/share"
           cp build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}" "$PKGNAME/"
           # See the Verify binaries step above for why this must exclude
-          # the qemu-system-*.p/ build-artifact dirs alongside the actual
+          # the qemu-system-*.p/ build-artifact dirs and (macOS only)
+          # the qemu-system-*-unsigned copies alongside the actual
           # binaries in build-zig-other/.
-          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -exec cp {} "$PKGNAME/" \;
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' -exec cp {} "$PKGNAME/" \;
           # See the Windows job's Package step for why pc-bios/'s *contents*
           # (not the pc-bios/ dir itself) go directly into share/, and why
           # it must be a sibling of the binaries above (empty
