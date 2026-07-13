@@ -9,11 +9,13 @@ name: Release
 # glib2/pixman) and now also build a qemu-system-<arch> matching the
 # runner's own host architecture (x86_64 on linux-x64, aarch64 on
 # linux-arm64/macos-arm64), each with the accelerator available on that
-# host: KVM on Linux, HVF on macOS. GitHub-hosted Linux runners have no
-# /dev/kvm (no nested virtualization), so KVM is only build-verified there,
-# not runtime-tested. macOS runners, however, run on real Apple hardware
-# (not nested), so HVF is genuinely usable in CI -- the macOS job boots the
-# bundled EDK2 aarch64 firmware under `-accel hvf` as a smoke test.
+# host: KVM on Linux, HVF on macOS. Neither is runtime-tested in CI: Linux
+# runners have no /dev/kvm, and while macOS runners do run on real Apple
+# hardware, their Hypervisor.framework access turns out to still be
+# restricted enough that even qemu-system-aarch64's `-M virt -accel hvf`
+# board init fails outright (hv_vm_config_get_max_ipa_size() returns
+# HV_UNSUPPORTED) -- confirmed by actually trying it in CI. So both are
+# build-verified only, same as WHPX on Windows below.
 #
 # The Windows job is replaced entirely: instead of a native windows-latest
 # runner + MSYS2 (see the ghr-branch version), it does a *true
@@ -74,7 +76,6 @@ jobs:
             system_target: aarch64-softmmu
             system_bin: qemu-system-aarch64
             accel_opt: --enable-hvf
-            boot_test: true
     outputs:
       qemu_sha: ${{ steps.resolve.outputs.commit }}
     defaults:
@@ -195,54 +196,6 @@ jobs:
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
           ninja qemu-img qemu-io "${{ matrix.system_bin }}"
-          # Unpack just the EDK2 aarch64 firmware (bzip2'd in-tree) for the
-          # HVF boot-test step below; the release package itself still
-          # bundles pc-bios/ as committed (see the Package step). The
-          # custom_target's ninja output path is namespaced under the
-          # pc-bios/ build subdir (from meson's subdir('pc-bios') call).
-          if [ "${{ matrix.boot_test }}" = "true" ]; then
-            ninja pc-bios/edk2-aarch64-code.fd
-          fi
-
-      - name: Boot-test ${{ matrix.system_bin }} with HVF (macOS)
-        if: matrix.boot_test == true
-        working-directory: build-zig
-        # macOS GitHub-hosted runners run on real Apple hardware (unlike
-        # Linux/Windows, which are themselves VMs), so -accel hvf gets
-        # genuine hardware acceleration here -- unlike KVM/WHPX above and
-        # in the Windows job, this can actually be runtime-tested in CI.
-        # Boots the bundled EDK2 firmware (no OS attached) and just checks
-        # it's still alive after a few seconds instead of exiting/crashing
-        # (e.g. on HVF init failure).
-        run: |
-          set +e
-          set -u
-          set -o pipefail
-          ./qemu-system-aarch64 \
-            -M virt -accel hvf -cpu host -m 512 \
-            -bios pc-bios/edk2-aarch64-code.fd \
-            -display none -serial stdio -monitor none -no-reboot \
-            > boot.log 2>&1 &
-          QEMU_PID=$!
-          sleep 15
-          if kill -0 "$QEMU_PID" 2>/dev/null; then
-            STILL_RUNNING=1
-            # SIGKILL, not SIGTERM: qemu's HVF vcpu-thread shutdown path
-            # can itself abort() when signaled externally mid-run, which
-            # would otherwise be misread as a crash rather than success.
-            kill -9 "$QEMU_PID"
-            wait "$QEMU_PID" 2>/dev/null
-          else
-            STILL_RUNNING=0
-            wait "$QEMU_PID"
-            RC=$?
-          fi
-          cat boot.log
-          if [ "$STILL_RUNNING" -ne 1 ]; then
-            echo "qemu-system-aarch64 exited early (rc=${RC:-?}) instead of running under HVF" >&2
-            exit 1
-          fi
-          echo "qemu-system-aarch64 booted EDK2 firmware under HVF and ran for 15s without crashing"
 
       - name: Verify binaries
         run: |
@@ -604,9 +557,11 @@ jobs:
             - **linux-arm64**: `qemu-system-aarch64` with KVM support (same
               caveat as above).
             - **macos-arm64**: `qemu-system-aarch64` with HVF
-              hardware-acceleration, actually boot-tested under `-accel hvf`
-              in CI -- macOS runners run on real Apple hardware, unlike
-              Linux/Windows runners.
+              hardware-acceleration support (compiled in; build-verified
+              only -- GitHub's macOS runners' Hypervisor.framework access
+              turns out to be restricted enough that even basic `-M virt
+              -accel hvf` board init fails there, so this isn't
+              runtime-testable in CI either).
             - **windows-x64**: `qemu-system-x86_64.exe` with WHPX
               hardware-acceleration support, manually verified to boot real
               guest code under `-accel whpx` on real Windows hardware (see
