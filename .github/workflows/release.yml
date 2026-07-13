@@ -197,9 +197,11 @@ jobs:
           ninja qemu-img qemu-io "${{ matrix.system_bin }}"
           # Unpack just the EDK2 aarch64 firmware (bzip2'd in-tree) for the
           # HVF boot-test step below; the release package itself still
-          # bundles pc-bios/ as committed (see the Package step).
+          # bundles pc-bios/ as committed (see the Package step). The
+          # custom_target's ninja output path is namespaced under the
+          # pc-bios/ build subdir (from meson's subdir('pc-bios') call).
           if [ "${{ matrix.boot_test }}" = "true" ]; then
-            ninja edk2-aarch64-code.fd
+            ninja pc-bios/edk2-aarch64-code.fd
           fi
 
       - name: Boot-test ${{ matrix.system_bin }} with HVF (macOS)
