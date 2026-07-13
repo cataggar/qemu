@@ -6,17 +6,32 @@ on:
     paths:
       - 'zig/qcow2/**'
       - '.github/workflows/zig-qcow2.yml'
+  # No `paths:` filter here (unlike push, above): see zig-nbd.yml for why
+  # a required check's workflow must always run.
   pull_request:
-    paths:
-      - 'zig/qcow2/**'
-      - '.github/workflows/zig-qcow2.yml'
 
 permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - 'zig/qcow2/**'
+              - '.github/workflows/zig-qcow2.yml'
+
   test:
-    name: Build & test
+    name: Build & test (qcow2)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
