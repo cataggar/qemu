@@ -690,45 +690,6 @@ jobs:
           target_commitish: ${{ needs.build.outputs.qemu_sha }}
           name: qemu ${{ inputs.version }}
           body: |
-            `qemu-img` / `qemu-io` plus a native `qemu-system-<arch>`,
-            built with [`zig cc`](https://ziglang.org/) from
-            [cataggar/qemu@${{ needs.build.outputs.qemu_sha }}](https://github.com/cataggar/qemu/commit/${{ needs.build.outputs.qemu_sha }})
-            (requested ref: `${{ inputs.qemu_ref }}`):
-
-            - **linux-x64**: `qemu-system-x86_64` with KVM support (compiled
-              in; GitHub-hosted Linux runners have no `/dev/kvm`, so this is
-              build-verified only, not runtime-tested in CI).
-            - **linux-arm64**: `qemu-system-aarch64` with KVM support (same
-              caveat as above).
-            - **macos-arm64**: `qemu-system-aarch64` with HVF
-              hardware-acceleration support (compiled in; build-verified
-              only -- GitHub's macOS runners' Hypervisor.framework access
-              turns out to be restricted enough that even basic `-M virt
-              -accel hvf` board init fails there, so this isn't
-              runtime-testable in CI either).
-            - **windows-x64**: `qemu-system-x86_64.exe` with WHPX
-              hardware-acceleration support, manually verified to boot real
-              guest code under `-accel whpx` on real Windows hardware (see
-              issue #20's writeup -- GitHub-hosted Windows runners don't
-              support nested virtualization, so this can't be
-              runtime-tested in CI).
-
-            Every package also ships **every other `qemu-system-<arch>`
-            target QEMU supports** (`arm`, `alpha`, `ppc`, `ppc64`,
-            `riscv32`/`riscv64`, `s390x`, the `mips*` variants, `sparc`,
-            `sparc64`, `m68k`, `sh4`, and the rest of
-            `configs/targets/*-softmmu.mak`), TCG-only: hardware
-            acceleration only ever applies to a target matching the host's
-            own architecture (the one called out above), so none of these
-            others have an accelerator to enable. These are build-verified
-            only, same as the accelerated binaries above.
-
-            The Windows package is built by **true cross-compilation from a
-            Linux runner** (no MSYS2, no vcpkg, no native Windows runner) --
-            see https://github.com/cataggar/qemu/issues/17 and
-            https://github.com/cataggar/qemu/issues/20 for the full
-            background.
-
             Installable with [ghr](https://cataggar.github.io/ghr/):
 
             ```
