@@ -215,7 +215,9 @@ jobs:
         # it's still alive after a few seconds instead of exiting/crashing
         # (e.g. on HVF init failure).
         run: |
-          set -uo pipefail
+          set +e
+          set -u
+          set -o pipefail
           ./qemu-system-aarch64 \
             -M virt -accel hvf -cpu host -m 512 \
             -bios pc-bios/edk2-aarch64-code.fd \
@@ -225,7 +227,10 @@ jobs:
           sleep 15
           if kill -0 "$QEMU_PID" 2>/dev/null; then
             STILL_RUNNING=1
-            kill "$QEMU_PID"
+            # SIGKILL, not SIGTERM: qemu's HVF vcpu-thread shutdown path
+            # can itself abort() when signaled externally mid-run, which
+            # would otherwise be misread as a crash rather than success.
+            kill -9 "$QEMU_PID"
             wait "$QEMU_PID" 2>/dev/null
           else
             STILL_RUNNING=0
