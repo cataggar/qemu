@@ -1,15 +1,26 @@
 name: Release
 
-# Builds qemu-img/qemu-io (and, for Windows, qemu-system-x86_64 with WHPX
-# hardware-acceleration support) with `zig cc` from a chosen commit of
-# cataggar/qemu and publishes them as a GitHub Release.
+# Builds qemu-img/qemu-io plus a native qemu-system-<arch> (with hardware
+# acceleration) for Linux, macOS, and Windows, with `zig cc` from a chosen
+# commit of cataggar/qemu, and publishes them as a GitHub Release.
 #
 # This is the zig16-branch counterpart of the `ghr`-branch release.yml.
-# The Linux/macOS jobs are unchanged (native builds, native package
-# managers for glib2/pixman). The Windows job is replaced entirely: instead
-# of a native windows-latest runner + MSYS2 (see the ghr-branch version),
-# it does a *true cross-compile* from an ubuntu-latest runner using our own
-# zig-built glib/pixman/libiconv/gettext/zlib/nettle (see
+# The Linux/macOS jobs are native builds (native package managers for
+# glib2/pixman) and now also build a qemu-system-<arch> matching the
+# runner's own host architecture (x86_64 on linux-x64, aarch64 on
+# linux-arm64/macos-arm64), each with the accelerator available on that
+# host: KVM on Linux, HVF on macOS. Neither is runtime-tested in CI: Linux
+# runners have no /dev/kvm, and while macOS runners do run on real Apple
+# hardware, their Hypervisor.framework access turns out to still be
+# restricted enough that even qemu-system-aarch64's `-M virt -accel hvf`
+# board init fails outright (hv_vm_config_get_max_ipa_size() returns
+# HV_UNSUPPORTED) -- confirmed by actually trying it in CI. So both are
+# build-verified only, same as WHPX on Windows below.
+#
+# The Windows job is replaced entirely: instead of a native windows-latest
+# runner + MSYS2 (see the ghr-branch version), it does a *true
+# cross-compile* from an ubuntu-latest runner using our own zig-built
+# glib/pixman/libiconv/gettext/zlib/nettle (see
 # https://github.com/cataggar/qemu/issues/17 and #20) -- no MSYS2, no
 # vcpkg, no native Windows runner at all. It also builds
 # qemu-system-x86_64.exe with WHPX acceleration in addition to the two
@@ -46,8 +57,14 @@ jobs:
         include:
           - os: ubuntu-24.04
             name: linux-x64
+            system_target: x86_64-softmmu
+            system_bin: qemu-system-x86_64
+            accel_opt: --enable-kvm
           - os: ubuntu-24.04-arm
             name: linux-arm64
+            system_target: aarch64-softmmu
+            system_bin: qemu-system-aarch64
+            accel_opt: --enable-kvm
           # Native build (not cross-compiled): zig cc as the compiler, but
           # dependencies (glib2/pixman) come from Homebrew. True
           # cross-compilation to macOS from Linux isn't covered by this
@@ -56,6 +73,9 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             experimental: true
+            system_target: aarch64-softmmu
+            system_bin: qemu-system-aarch64
+            accel_opt: --enable-hvf
     outputs:
       qemu_sha: ${{ steps.resolve.outputs.commit }}
     defaults:
@@ -101,12 +121,16 @@ jobs:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Build qemu-img/qemu-io with zig cc (Linux)
+      - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (Linux)
         if: runner.os == 'Linux'
         # Mirrors scripts/build-with-zig-cc.sh on the zig16 branch (inlined
         # here so this works against any qemu_ref, including commits that
-        # predate that script), but only builds the two tool binaries this
-        # release packages instead of the full `ninja` (all targets) build.
+        # predate that script), but only builds the tool/system binaries
+        # this release packages instead of the full `ninja` (all targets)
+        # build. --bindir=/--with-suffix= (both empty) make the built
+        # binary and its share/ firmware directory sibling directories at
+        # runtime (get_relocated_path() in util/cutils.c), matching how
+        # they'll be laid out in the release package below.
         run: |
           set -euo pipefail
           case "$(uname -m)" in
@@ -133,14 +157,18 @@ jobs:
             --cc="zig cc" \
             --cxx="zig c++" \
             --with-pkgversion="${{ inputs.version }}" \
+            --target-list="${{ matrix.system_target }}" \
+            ${{ matrix.accel_opt }} \
+            --bindir= \
+            --with-suffix= \
             --disable-werror \
             --disable-plugins \
             --enable-strip \
             --extra-cflags="$EXTRA_FLAGS" \
             --extra-cxxflags="$EXTRA_FLAGS"
-          ninja qemu-img qemu-io
+          ninja qemu-img qemu-io "${{ matrix.system_bin }}"
 
-      - name: Build qemu-img/qemu-io with zig cc (macOS)
+      - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (macOS)
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
@@ -156,23 +184,35 @@ jobs:
             --cc="zig cc" \
             --cxx="zig c++" \
             --with-pkgversion="${{ inputs.version }}" \
+            --target-list="${{ matrix.system_target }}" \
+            --without-default-features \
+            --enable-tools \
+            ${{ matrix.accel_opt }} \
+            --bindir= \
+            --with-suffix= \
             --disable-werror \
             --disable-plugins \
             --enable-strip \
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
-          ninja qemu-img qemu-io
+          ninja qemu-img qemu-io "${{ matrix.system_bin }}"
 
       - name: Verify binaries
         run: |
           ./build-zig/qemu-img --version
           ./build-zig/qemu-io --version
+          ./build-zig/${{ matrix.system_bin }} --version
 
       - name: Package
         run: |
           PKGNAME="qemu-${{ inputs.version }}-${{ matrix.name }}"
-          mkdir -p "$PKGNAME"
-          cp build-zig/qemu-img build-zig/qemu-io "$PKGNAME/"
+          mkdir -p "$PKGNAME/share"
+          cp build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}" "$PKGNAME/"
+          # See the Windows job's Package step for why pc-bios/'s *contents*
+          # (not the pc-bios/ dir itself) go directly into share/, and why
+          # it must be a sibling of the binaries above (empty
+          # --bindir=/--with-suffix= at configure time, see build step).
+          cp -r pc-bios/* "$PKGNAME/share/"
           cp COPYING "$PKGNAME/" 2>/dev/null || true
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
 
@@ -506,19 +546,34 @@ jobs:
           target_commitish: ${{ needs.build.outputs.qemu_sha }}
           name: qemu ${{ inputs.version }}
           body: |
-            `qemu-img` / `qemu-io` (Linux, macOS, Windows) and, on Windows,
-            `qemu-system-x86_64` with WHPX hardware-acceleration support,
+            `qemu-img` / `qemu-io` plus a native `qemu-system-<arch>`,
             built with [`zig cc`](https://ziglang.org/) from
             [cataggar/qemu@${{ needs.build.outputs.qemu_sha }}](https://github.com/cataggar/qemu/commit/${{ needs.build.outputs.qemu_sha }})
-            (requested ref: `${{ inputs.qemu_ref }}`).
+            (requested ref: `${{ inputs.qemu_ref }}`):
+
+            - **linux-x64**: `qemu-system-x86_64` with KVM support (compiled
+              in; GitHub-hosted Linux runners have no `/dev/kvm`, so this is
+              build-verified only, not runtime-tested in CI).
+            - **linux-arm64**: `qemu-system-aarch64` with KVM support (same
+              caveat as above).
+            - **macos-arm64**: `qemu-system-aarch64` with HVF
+              hardware-acceleration support (compiled in; build-verified
+              only -- GitHub's macOS runners' Hypervisor.framework access
+              turns out to be restricted enough that even basic `-M virt
+              -accel hvf` board init fails there, so this isn't
+              runtime-testable in CI either).
+            - **windows-x64**: `qemu-system-x86_64.exe` with WHPX
+              hardware-acceleration support, manually verified to boot real
+              guest code under `-accel whpx` on real Windows hardware (see
+              issue #20's writeup -- GitHub-hosted Windows runners don't
+              support nested virtualization, so this can't be
+              runtime-tested in CI).
 
             The Windows package is built by **true cross-compilation from a
             Linux runner** (no MSYS2, no vcpkg, no native Windows runner) --
             see https://github.com/cataggar/qemu/issues/17 and
             https://github.com/cataggar/qemu/issues/20 for the full
-            background, and issue #20 for manual verification that
-            `qemu-system-x86_64.exe` boots real guest code under
-            `-accel whpx` on real Windows hardware.
+            background.
 
             Installable with [ghr](https://cataggar.github.io/ghr/):
 
