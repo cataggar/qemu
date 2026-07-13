@@ -17,6 +17,15 @@ name: Release
 # HV_UNSUPPORTED) -- confirmed by actually trying it in CI. So both are
 # build-verified only, same as WHPX on Windows below.
 #
+# Every host also builds and ships *every other* QEMU softmmu target
+# (configs/targets/*-softmmu.mak) TCG-only, i.e. without an accelerator:
+# KVM/HVF/WHPX only ever apply to a target matching the host's own
+# architecture (the one already covered above), so none of these others
+# have a hardware accelerator to enable in the first place. These are
+# built in a second, separate configure/ninja invocation per host so the
+# primary target's accelerated build above stays untouched, and are
+# build-verified only (same caveat as the accelerated binaries above).
+#
 # The Windows job is replaced entirely: instead of a native windows-latest
 # runner + MSYS2 (see the ghr-branch version), it does a *true
 # cross-compile* from an ubuntu-latest runner using our own zig-built
@@ -168,6 +177,36 @@ jobs:
             --extra-cxxflags="$EXTRA_FLAGS"
           ninja qemu-img qemu-io "${{ matrix.system_bin }}"
 
+      - name: Build other (non-accelerated) qemu-system-* targets (Linux)
+        if: runner.os == 'Linux'
+        # Every softmmu target other than matrix.system_target above,
+        # TCG-only (no --enable-kvm): reuses the linux-headers copy the
+        # step above already created, in a separate build dir so this
+        # doesn't disturb the accelerated build.
+        run: |
+          set -euo pipefail
+          ALL_TARGETS="$(cd configs/targets && ls *-softmmu.mak | sed 's/\.mak$//')"
+          OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx '${{ matrix.system_target }}' | paste -sd, -)"
+
+          BUILD_DIR="$PWD/build-zig-other"
+          mkdir -p "$BUILD_DIR"
+          EXTRA_FLAGS="-UNDEBUG -I$PWD/build-zig/zig-linux-headers-copy"
+
+          cd "$BUILD_DIR"
+          ../configure \
+            --cc="zig cc" \
+            --cxx="zig c++" \
+            --with-pkgversion="${{ inputs.version }}" \
+            --target-list="$OTHER_TARGETS" \
+            --bindir= \
+            --with-suffix= \
+            --disable-werror \
+            --disable-plugins \
+            --enable-strip \
+            --extra-cflags="$EXTRA_FLAGS" \
+            --extra-cxxflags="$EXTRA_FLAGS"
+          ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
+
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -197,17 +236,53 @@ jobs:
             --extra-cxxflags="-UNDEBUG"
           ninja qemu-img qemu-io "${{ matrix.system_bin }}"
 
+      - name: Build other (non-accelerated) qemu-system-* targets (macOS)
+        if: runner.os == 'macOS'
+        # Every softmmu target other than matrix.system_target above,
+        # TCG-only (no --enable-hvf), in a separate build dir so this
+        # doesn't disturb the accelerated build.
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+
+          ALL_TARGETS="$(cd configs/targets && ls *-softmmu.mak | sed 's/\.mak$//')"
+          OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx '${{ matrix.system_target }}' | paste -sd, -)"
+
+          BUILD_DIR="$PWD/build-zig-other"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          ../configure \
+            --cc="zig cc" \
+            --cxx="zig c++" \
+            --with-pkgversion="${{ inputs.version }}" \
+            --target-list="$OTHER_TARGETS" \
+            --without-default-features \
+            --enable-tools \
+            --bindir= \
+            --with-suffix= \
+            --disable-werror \
+            --disable-plugins \
+            --enable-strip \
+            --extra-cflags="-UNDEBUG" \
+            --extra-cxxflags="-UNDEBUG"
+          ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
+
       - name: Verify binaries
         run: |
           ./build-zig/qemu-img --version
           ./build-zig/qemu-io --version
           ./build-zig/${{ matrix.system_bin }} --version
+          for bin in build-zig-other/qemu-system-*; do
+            "$bin" --version
+          done
 
       - name: Package
         run: |
           PKGNAME="qemu-${{ inputs.version }}-${{ matrix.name }}"
           mkdir -p "$PKGNAME/share"
           cp build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}" "$PKGNAME/"
+          cp build-zig-other/qemu-system-* "$PKGNAME/"
           # See the Windows job's Package step for why pc-bios/'s *contents*
           # (not the pc-bios/ dir itself) go directly into share/, and why
           # it must be a sibling of the binaries above (empty
@@ -489,19 +564,88 @@ jobs:
 
           ninja qemu-img.exe qemu-io.exe qemu-system-x86_64.exe
 
+      - name: Build other (non-accelerated) qemu-system-*.exe targets
+        # Every softmmu target other than x86_64-softmmu above,
+        # cross-compiled the same way but without --enable-whpx: WHPX
+        # only ever accelerates a target matching the host's own
+        # architecture (x86_64, already built above), so none of these
+        # others have an accelerator to enable. Reuses the dependency
+        # builds, generated .pc files, import-lib aliases, and windres
+        # wrapper from the step above (all target-list-independent) --
+        # only the build dir and configure's --target-list/--enable-whpx
+        # differ.
+        run: |
+          set -euo pipefail
+
+          ZIG_TARGET=x86_64-windows-gnu
+          CROSS_PREFIX=x86_64-w64-mingw32-
+          SRC_DIR="$PWD/qemu"
+          PREV_BUILD_DIR="$PWD/build-zig-windows"
+          BUILD_DIR="$PWD/build-zig-windows-other"
+          mkdir -p "$BUILD_DIR"
+
+          export PKG_CONFIG_PATH="$PREV_BUILD_DIR/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$PREV_BUILD_DIR/pkgconfig"
+          export PKG_CONFIG=pkg-config
+          export WINDRES="${CROSS_PREFIX}windres --preprocessor=$PREV_BUILD_DIR/defs/rc-preprocessor.sh"
+
+          ALL_TARGETS="$(cd "$SRC_DIR/configs/targets" && ls *-softmmu.mak | sed 's/\.mak$//')"
+          OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx x86_64-softmmu | paste -sd, -)"
+
+          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION"
+          EXTRA_LDFLAGS="-L$PREV_BUILD_DIR/windows-import-libs"
+
+          cd "$BUILD_DIR"
+          "$SRC_DIR/configure" \
+              --cross-prefix="$CROSS_PREFIX" \
+              --cc="zig cc -target $ZIG_TARGET" \
+              --cxx="zig c++ -target $ZIG_TARGET" \
+              --with-pkgversion="${{ inputs.version }}" \
+              --target-list="$OTHER_TARGETS" \
+              --enable-tools \
+              --enable-nettle \
+              --disable-gcrypt \
+              --disable-gnutls \
+              --disable-sdl \
+              --disable-gtk \
+              --disable-vnc \
+              --disable-opengl \
+              --disable-virglrenderer \
+              --disable-dbus-display \
+              --disable-guest-agent \
+              --disable-werror \
+              --disable-plugins \
+              --disable-curses \
+              --disable-brlapi \
+              --disable-spice \
+              --disable-usb-redir \
+              --disable-install-blobs \
+              --enable-strip \
+              --extra-cflags="$EXTRA_FLAGS" \
+              --extra-cxxflags="$EXTRA_FLAGS" \
+              --extra-ldflags="$EXTRA_LDFLAGS"
+
+          ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/' -e 's/$/.exe/')
+
       - name: Verify binaries
         # Cross-compiled *for* Windows, built *on* Linux -- can't execute
         # these here (no Windows runner, no Wine), so just confirm each is
-        # a real PE32+ executable. See cataggar/qemu#20 for how these were
-        # actually run and boot-tested, manually, on real Windows hardware.
-        working-directory: build-zig-windows
-        run: file qemu-img.exe qemu-io.exe qemu-system-x86_64.exe | tee /dev/stderr | grep -c 'PE32+ executable' | grep -q '^3$'
+        # a real PE32+ executable. See cataggar/qemu#20 for how
+        # qemu-system-x86_64.exe (the only accelerated one, WHPX) was
+        # actually run and boot-tested, manually, on real Windows
+        # hardware; every other qemu-system-*.exe below is TCG-only and
+        # build-verified only.
+        run: |
+          EXES=$(ls build-zig-windows/*.exe build-zig-windows-other/*.exe)
+          COUNT=$(printf '%s\n' "$EXES" | wc -l)
+          file $EXES | tee /dev/stderr | grep -c 'PE32+ executable' | grep -qx "$COUNT"
 
       - name: Package
         run: |
           PKGNAME="qemu-${{ inputs.version }}-windows-x64"
           mkdir -p "$PKGNAME/share"
           cp build-zig-windows/qemu-img.exe build-zig-windows/qemu-io.exe build-zig-windows/qemu-system-x86_64.exe "$PKGNAME/"
+          cp build-zig-windows-other/qemu-system-*.exe "$PKGNAME/"
           # QEMU's runtime firmware/data lookup (util/datadir.c,
           # util/cutils.c's get_relocated_path()) is relocatable: it
           # resolves relative to the running .exe's own directory. But on
@@ -568,6 +712,16 @@ jobs:
               issue #20's writeup -- GitHub-hosted Windows runners don't
               support nested virtualization, so this can't be
               runtime-tested in CI).
+
+            Every package also ships **every other `qemu-system-<arch>`
+            target QEMU supports** (`arm`, `alpha`, `ppc`, `ppc64`,
+            `riscv32`/`riscv64`, `s390x`, the `mips*` variants, `sparc`,
+            `sparc64`, `m68k`, `sh4`, and the rest of
+            `configs/targets/*-softmmu.mak`), TCG-only: hardware
+            acceleration only ever applies to a target matching the host's
+            own architecture (the one called out above), so none of these
+            others have an accelerator to enable. These are build-verified
+            only, same as the accelerated binaries above.
 
             The Windows package is built by **true cross-compilation from a
             Linux runner** (no MSYS2, no vcpkg, no native Windows runner) --
