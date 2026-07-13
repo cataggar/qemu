@@ -273,16 +273,22 @@ jobs:
           ./build-zig/qemu-img --version
           ./build-zig/qemu-io --version
           ./build-zig/${{ matrix.system_bin }} --version
-          for bin in build-zig-other/qemu-system-*; do
-            "$bin" --version
-          done
+          # -maxdepth 1 -type f: build-zig-other/ also contains meson/ninja
+          # build-artifact dirs alongside each binary (e.g.
+          # qemu-system-alpha.p/), which the plain qemu-system-* glob used
+          # to match too, causing "$bin: Is a directory" here.
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -print0 |
+            while IFS= read -r -d '' bin; do "$bin" --version; done
 
       - name: Package
         run: |
           PKGNAME="qemu-${{ inputs.version }}-${{ matrix.name }}"
           mkdir -p "$PKGNAME/share"
           cp build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}" "$PKGNAME/"
-          cp build-zig-other/qemu-system-* "$PKGNAME/"
+          # See the Verify binaries step above for why this must exclude
+          # the qemu-system-*.p/ build-artifact dirs alongside the actual
+          # binaries in build-zig-other/.
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -exec cp {} "$PKGNAME/" \;
           # See the Windows job's Package step for why pc-bios/'s *contents*
           # (not the pc-bios/ dir itself) go directly into share/, and why
           # it must be a sibling of the binaries above (empty
@@ -590,7 +596,16 @@ jobs:
           export WINDRES="${CROSS_PREFIX}windres --preprocessor=$PREV_BUILD_DIR/defs/rc-preprocessor.sh"
 
           ALL_TARGETS="$(cd "$SRC_DIR/configs/targets" && ls *-softmmu.mak | sed 's/\.mak$//')"
-          OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx x86_64-softmmu | paste -sd, -)"
+          # hexagon-softmmu excluded: its target/hexagon/idef-parser is a
+          # *build-machine* helper tool that meson compiles and runs during
+          # the build itself, not part of the final (Windows) target --
+          # but our single PKG_CONFIG_PATH above only describes Windows
+          # (cross/host-machine) dependencies, so linking that native
+          # helper against them fails ("cannot find -lglib-2.0" et al, the
+          # native /usr/bin/ld can't use our Windows-target glib build).
+          # Fixing this needs a proper meson --native-file with its own,
+          # separate (build-machine) glib -- out of scope here.
+          OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx -e x86_64-softmmu -e hexagon-softmmu | paste -sd, -)"
 
           EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION"
           EXTRA_LDFLAGS="-L$PREV_BUILD_DIR/windows-import-libs"
