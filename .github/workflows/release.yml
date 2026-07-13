@@ -268,6 +268,18 @@ jobs:
             --extra-cxxflags="-UNDEBUG"
           ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
 
+      - name: Strip binaries
+        # --enable-strip (-Dstrip=true) only strips *on install*
+        # (per `meson configure`'s own help text: "Strip targets on
+        # install"), but this workflow only ever runs plain `ninja
+        # <target>`, never `ninja install` -- so it silently did nothing,
+        # leaving every binary built with full debug info (confirmed via
+        # `file`: "with debug_info, not stripped"), ~3-4x larger than a
+        # stripped build. Strip explicitly instead.
+        run: |
+          strip build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}"
+          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -exec strip {} +
+
       - name: Verify binaries
         run: |
           ./build-zig/qemu-img --version
@@ -641,6 +653,14 @@ jobs:
               --extra-ldflags="$EXTRA_LDFLAGS"
 
           ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/' -e 's/$/.exe/')
+
+      - name: Strip binaries
+        # Same issue as the Linux/macOS jobs' Strip binaries step:
+        # --enable-strip (-Dstrip=true) only strips *on install*, which
+        # this workflow never runs. Strip explicitly with the mingw
+        # cross-strip (binutils-mingw-w64-x86-64, installed above).
+        run: |
+          x86_64-w64-mingw32-strip build-zig-windows/*.exe build-zig-windows-other/*.exe
 
       - name: Verify binaries
         # Cross-compiled *for* Windows, built *on* Linux -- can't execute
