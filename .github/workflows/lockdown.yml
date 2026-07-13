@@ -12,6 +12,17 @@ permissions:
 jobs:
   action:
     runs-on: ubuntu-latest
+    # Skip for the repo owner/collaborators: this fork actively develops
+    # the zig cc work via real PRs (e.g. #22, #23), unlike a pure read-only
+    # mirror. author_association is OWNER for the repo owner and
+    # COLLABORATOR/MEMBER for anyone else granted push access; everyone
+    # else (random drive-by contributors, the intended audience for the
+    # boilerplate below) still gets auto-closed/locked as before.
+    if: >-
+      !contains(
+        fromJSON('["OWNER", "COLLABORATOR", "MEMBER"]'),
+        github.event.pull_request.author_association
+      )
     steps:
       - uses: dessant/repo-lockdown@17c2cc64a91eff426f242b05dd523c6f098889b6 # v5.0.2
         with:
