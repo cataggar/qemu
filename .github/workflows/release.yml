@@ -184,6 +184,8 @@ jobs:
             --cxx="zig c++" \
             --with-pkgversion="${{ inputs.version }}" \
             --target-list="${{ matrix.system_target }}" \
+            --without-default-features \
+            --enable-tools \
             ${{ matrix.accel_opt }} \
             --bindir= \
             --with-suffix= \
