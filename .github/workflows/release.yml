@@ -277,33 +277,22 @@ jobs:
         # leaving every binary built with full debug info (confirmed via
         # `file`: "with debug_info, not stripped"), ~3-4x larger than a
         # stripped build. Strip explicitly instead.
+        #
+        # Deliberately not done on macOS: `strip` invalidates a Mach-O's
+        # code signature without reapplying one, and Apple Silicon's
+        # kernel refuses to *launch* any binary whose signature doesn't
+        # match its current bytes (unrelated to Gatekeeper/notarization).
+        # Re-signing afterwards (ad hoc, plus reapplying
+        # accel/hvf/entitlements.plist to the HVF-accelerated target)
+        # does work -- v11.0.50-z.5 shipped that way -- but was measured
+        # to only save ~15% of the already-small (once the *-unsigned
+        # copies below are excluded) compressed package size, not worth
+        # the ongoing risk of a future QEMU version changing what needs
+        # signing/entitlements and this workflow silently shipping
+        # broken binaries again (as v11.0.50-z.4 did).
         run: |
           strip build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}"
           find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' -exec strip {} +
-
-      - name: Strip binaries (macOS)
-        if: runner.os == 'macOS'
-        # Same underlying issue as the Linux Strip binaries step, but on
-        # macOS a plain `strip` isn't enough: Apple Silicon's kernel
-        # refuses to even *launch* a Mach-O binary whose code signature
-        # doesn't match its current bytes (unrelated to
-        # Gatekeeper/notarization -- this is enforced for every binary,
-        # signed ad hoc or not), and `strip` invalidates the signature
-        # meson.build's entitlement.sh already applied without
-        # reapplying one. Re-sign ad hoc after stripping so these still
-        # run; the primary (HVF-accelerated) target additionally needs
-        # its entitlements reapplied, or Hypervisor.framework access is
-        # silently denied even though the binary itself still launches.
-        run: |
-          strip build-zig/qemu-img build-zig/qemu-io
-          codesign -f -s - build-zig/qemu-img build-zig/qemu-io
-          strip "build-zig/${{ matrix.system_bin }}"
-          codesign -f -s - --entitlements accel/hvf/entitlements.plist "build-zig/${{ matrix.system_bin }}"
-          # -unsigned: meson.build builds every macOS target twice --
-          # once as "<name>-unsigned", then signs it into the final
-          # "<name>" -- so exclude the leftover unsigned copies here too.
-          find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' \
-            -exec strip {} \; -exec codesign -f -s - {} \;
 
       - name: Verify binaries
         run: |
@@ -315,7 +304,7 @@ jobs:
           # qemu-system-alpha.p/), which the plain qemu-system-* glob used
           # to match too, causing "$bin: Is a directory" here. On macOS,
           # it also contains a "<name>-unsigned" copy of every target
-          # (see the Strip binaries (macOS) step above) -- exclude those
+          # (see the Strip binaries (Linux) step above) -- exclude those
           # too, we only want the final signed binary.
           find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' -print0 |
             while IFS= read -r -d '' bin; do "$bin" --version; done
