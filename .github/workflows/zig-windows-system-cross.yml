@@ -45,11 +45,9 @@ jobs:
 
       # Sibling checkouts expected by
       # scripts/build-with-zig-cc-windows-system.sh (as ../pixman, ../glib,
-      # ../libiconv, ../gettext, ../zlib, ../zstd, ../nettle relative to
-      # the qemu checkout). Same as zig-windows-cross.yml, plus nettle
-      # (needed here since --target-list=x86_64-softmmu makes
-      # have_system=true, pulling meson.build's crypto backend selection
-      # back in).
+      # ../libiconv, ../gettext, ../zlib, ../zstd, ../nettle, ../libslirp
+      # relative to the qemu checkout). Same as zig-windows-cross.yml,
+      # plus nettle (system crypto) and libslirp (user-mode networking).
       - name: Checkout pixman
         uses: actions/checkout@v4
         with:
@@ -98,6 +96,13 @@ jobs:
           repository: cataggar/nettle
           ref: zig16
           path: nettle
+
+      - name: Checkout libslirp
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/libslirp
+          ref: zig16
+          path: libslirp
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.4

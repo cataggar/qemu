@@ -18,8 +18,9 @@
 #
 # Prerequisites: same as scripts/build-with-zig-cc-windows.sh (zig 0.16.0,
 # meson/ninja/pkg-config/python3, binutils-mingw-w64-x86-64), plus a
-# sibling zig16 checkout of https://github.com/cataggar/nettle at
-# ../nettle (or under $QEMU_ZIG_DEPS_DIR).
+# sibling zig16 checkouts of https://github.com/cataggar/nettle and
+# https://github.com/cataggar/libslirp at ../nettle and ../libslirp (or
+# under $QEMU_ZIG_DEPS_DIR).
 #
 # nettle is needed here (unlike the tools-only build) because
 # --target-list=x86_64-softmmu makes have_system=true, and meson.build's
@@ -39,7 +40,7 @@ ZIG_TARGET=x86_64-windows-gnu
 export ZIG_TARGET   # read by scripts/zig-cc-windows-defs/rc-preprocessor.sh
 CROSS_PREFIX=x86_64-w64-mingw32-
 
-DEPS="pixman glib libiconv gettext zlib zstd nettle"
+DEPS="pixman glib libiconv gettext zlib zstd nettle libslirp"
 
 for dep in $DEPS; do
   dep_dir="$DEPS_DIR/$dep"
@@ -96,6 +97,10 @@ write_pc nettle 4.0 \
   "-I$DEPS_DIR/nettle/zig-out/include" \
   "-L$DEPS_DIR/nettle/zig-out/lib -lnettle"
 
+write_pc slirp 4.9.3 \
+  "-I$DEPS_DIR/libslirp/zig-out/include/slirp -DLIBSLIRP_STATIC" \
+  "-L$DEPS_DIR/libslirp/zig-out/lib -lslirp -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32 -liphlpapi"
+
 export PKG_CONFIG_PATH="$PC_DIR"
 export PKG_CONFIG_LIBDIR="$PC_DIR"
 export PKG_CONFIG=pkg-config   # see scripts/build-with-zig-cc-windows.sh
@@ -131,6 +136,7 @@ cd "$BUILD_DIR"
     --enable-tools \
     --enable-whpx \
     --enable-nettle \
+    --enable-slirp \
     --enable-zstd \
     --disable-gcrypt \
     --disable-gnutls \

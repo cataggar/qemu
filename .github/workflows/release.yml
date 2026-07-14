@@ -29,7 +29,7 @@ name: Release
 # The Windows job is replaced entirely: instead of a native windows-latest
 # runner + MSYS2 (see the ghr-branch version), it does a *true
 # cross-compile* from an ubuntu-latest runner using our own zig-built
-# glib/pixman/libiconv/gettext/zlib/zstd/nettle (see
+# glib/pixman/libiconv/gettext/zlib/zstd/nettle/libslirp (see
 # https://github.com/cataggar/qemu/issues/17 and #20) -- no MSYS2, no
 # vcpkg, no native Windows runner at all. It also builds
 # qemu-system-x86_64.exe with WHPX acceleration in addition to the two
@@ -111,7 +111,8 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             bash bc bison bzip2 ca-certificates ccache findutils flex gcc git \
             libc6-dev libfdt-dev libffi-dev libglib2.0-dev libpixman-1-dev \
-            locales make ninja-build pkgconf python3 python3-venv sed tar
+            libslirp-dev locales make ninja-build pkgconf python3 python3-venv \
+            sed tar
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -120,7 +121,7 @@ jobs:
         # build (even just for `configure`, via the hexagon target parser).
         run: |
           brew update
-          brew install bison flex glib pixman pkg-config ninja meson
+          brew install bison flex glib libslirp pixman pkg-config ninja meson
 
       - name: Install zig cc via ghr
         uses: cataggar/ghr/actions/install@v0.6.6
@@ -172,6 +173,7 @@ jobs:
             --with-suffix= \
             --disable-werror \
             --disable-plugins \
+            --enable-slirp \
             --enable-strip \
             --extra-cflags="$EXTRA_FLAGS" \
             --extra-cxxflags="$EXTRA_FLAGS"
@@ -202,6 +204,7 @@ jobs:
             --with-suffix= \
             --disable-werror \
             --disable-plugins \
+            --enable-slirp \
             --enable-strip \
             --extra-cflags="$EXTRA_FLAGS" \
             --extra-cxxflags="$EXTRA_FLAGS"
@@ -231,6 +234,7 @@ jobs:
             --with-suffix= \
             --disable-werror \
             --disable-plugins \
+            --enable-slirp \
             --enable-strip \
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
@@ -263,6 +267,7 @@ jobs:
             --with-suffix= \
             --disable-werror \
             --disable-plugins \
+            --enable-slirp \
             --enable-strip \
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
@@ -401,6 +406,13 @@ jobs:
           ref: zig16
           path: nettle
 
+      - name: Checkout libslirp
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cataggar/libslirp
+          ref: zig16
+          path: libslirp
+
       - name: Install zig cc via ghr
         uses: cataggar/ghr/actions/install@v0.6.6
         env:
@@ -436,7 +448,7 @@ jobs:
           SRC_DIR="$PWD/qemu"
           BUILD_DIR="$PWD/build-zig-windows"
 
-          for dep in pixman glib libiconv gettext zlib zstd nettle; do
+          for dep in pixman glib libiconv gettext zlib zstd nettle libslirp; do
             echo "== building $dep for $ZIG_TARGET =="
             ( cd "$DEPS_DIR/$dep" && zig build -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseFast )
           done
@@ -478,6 +490,10 @@ jobs:
           write_pc nettle 4.0 \
             "-I$DEPS_DIR/nettle/zig-out/include" \
             "-L$DEPS_DIR/nettle/zig-out/lib -lnettle"
+
+          write_pc slirp 4.9.3 \
+            "-I$DEPS_DIR/libslirp/zig-out/include/slirp -DLIBSLIRP_STATIC" \
+            "-L$DEPS_DIR/libslirp/zig-out/lib -lslirp -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32 -liphlpapi"
 
           export PKG_CONFIG_PATH="$PC_DIR"
           export PKG_CONFIG_LIBDIR="$PC_DIR"
@@ -588,6 +604,7 @@ jobs:
               --enable-tools \
               --enable-whpx \
               --enable-nettle \
+              --enable-slirp \
               --enable-zstd \
               --disable-gcrypt \
               --disable-gnutls \
@@ -661,6 +678,7 @@ jobs:
               --target-list="$OTHER_TARGETS" \
               --enable-tools \
               --enable-nettle \
+              --enable-slirp \
               --enable-zstd \
               --disable-gcrypt \
               --disable-gnutls \
