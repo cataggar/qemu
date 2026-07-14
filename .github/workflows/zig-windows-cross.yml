@@ -2,8 +2,8 @@ name: zig-windows-cross
 
 # True cross-compilation of qemu-img.exe/qemu-io.exe for Windows
 # (x86_64-windows-gnu) from an ubuntu-latest runner using `zig cc`/`zig c++`
-# plus our own zig-built glib/pixman/libiconv/gettext/zlib -- no MSYS2, no
-# vcpkg, no native windows-latest runner. See
+# plus our own zig-built glib/pixman/libiconv/gettext/zlib/zstd -- no
+# MSYS2, no vcpkg, no native windows-latest runner. See
 # https://github.com/cataggar/qemu/issues/17 for the background: QEMU
 # hard-requires glib2 and pixman even for the tools-only qemu-img/qemu-io
 # targets, and there's no cross-compiled Windows build of them available
@@ -40,10 +40,9 @@ jobs:
           path: qemu
 
       # Sibling checkouts expected by scripts/build-with-zig-cc-windows.sh
-      # (as ../pixman, ../glib, ../libiconv, ../gettext, ../zlib relative
-      # to the qemu checkout). Each is a real upstream source tree plus a
-      # hand-written build.zig/build.zig.zon, built and verified
-      # independently (see each repo's own zig16 branch / README history).
+      # (as ../pixman, ../glib, ../libiconv, ../gettext, ../zlib, ../zstd
+      # relative to the qemu checkout). Each dependency has a hand-written
+      # build.zig on its zig16 branch.
       - name: Checkout pixman
         uses: actions/checkout@v4
         with:
@@ -78,6 +77,13 @@ jobs:
           repository: cataggar/zlib
           ref: zig16
           path: zlib
+
+      - name: Checkout zstd
+        uses: actions/checkout@v4
+        with:
+          repository: cataggar/zstd
+          ref: zig16
+          path: zstd
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.4

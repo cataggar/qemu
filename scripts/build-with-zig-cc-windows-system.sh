@@ -18,8 +18,9 @@
 #
 # Prerequisites: same as scripts/build-with-zig-cc-windows.sh (zig 0.16.0,
 # meson/ninja/pkg-config/python3, binutils-mingw-w64-x86-64), plus a
-# sibling zig16 checkout of https://github.com/cataggar/nettle at
-# ../nettle (or under $QEMU_ZIG_DEPS_DIR).
+# sibling zig16 checkouts of https://github.com/cataggar/nettle and
+# https://github.com/cataggar/libslirp at ../nettle and ../libslirp (or
+# under $QEMU_ZIG_DEPS_DIR).
 #
 # nettle is needed here (unlike the tools-only build) because
 # --target-list=x86_64-softmmu makes have_system=true, and meson.build's
@@ -39,7 +40,7 @@ ZIG_TARGET=x86_64-windows-gnu
 export ZIG_TARGET   # read by scripts/zig-cc-windows-defs/rc-preprocessor.sh
 CROSS_PREFIX=x86_64-w64-mingw32-
 
-DEPS="pixman glib libiconv gettext zlib nettle"
+DEPS="pixman glib libiconv gettext zlib zstd nettle libslirp"
 
 for dep in $DEPS; do
   dep_dir="$DEPS_DIR/$dep"
@@ -56,13 +57,14 @@ BUILD_DIR="$(cd "$BUILD_DIR" && pwd)"
 PC_DIR="$BUILD_DIR/pkgconfig"
 
 # See scripts/build-with-zig-cc-windows.sh for the rationale behind this
-# helper and the glib-2.0/pixman-1/zlib .pc contents; nettle.pc is new here.
+# helper and the glib-2.0/pixman-1/zlib/libzstd .pc contents; nettle.pc is
+# new here.
 write_pc() {
   local name="$1" version="$2" cflags="$3" libs="$4" vars="${5:-}"
   { [ -n "$vars" ] && printf '%s\n' "$vars"
     cat <<EOF
 Name: $name
-Description: zig cc build of $name for $ZIG_TARGET (see cataggar/$name, zig16 branch)
+Description: zig cc build of $name for $ZIG_TARGET
 Version: $version
 Cflags: $cflags
 Libs: $libs
@@ -73,6 +75,10 @@ EOF
 write_pc zlib 1.3.2 \
   "-I$DEPS_DIR/zlib/zig-out/include" \
   "-L$DEPS_DIR/zlib/zig-out/lib -lz"
+
+write_pc libzstd 1.6.0 \
+  "-I$DEPS_DIR/zstd/zig-out/include" \
+  "-L$DEPS_DIR/zstd/zig-out/lib -lzstd"
 
 write_pc pixman-1 0.46.5 \
   "-I$DEPS_DIR/pixman/zig-out/include/pixman-1" \
@@ -90,6 +96,10 @@ bindir=\${prefix}/bin"
 write_pc nettle 4.0 \
   "-I$DEPS_DIR/nettle/zig-out/include" \
   "-L$DEPS_DIR/nettle/zig-out/lib -lnettle"
+
+write_pc slirp 4.9.3 \
+  "-I$DEPS_DIR/libslirp/zig-out/include/slirp -DLIBSLIRP_STATIC" \
+  "-L$DEPS_DIR/libslirp/zig-out/lib -lslirp -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32 -liphlpapi"
 
 export PKG_CONFIG_PATH="$PC_DIR"
 export PKG_CONFIG_LIBDIR="$PC_DIR"
@@ -126,6 +136,8 @@ cd "$BUILD_DIR"
     --enable-tools \
     --enable-whpx \
     --enable-nettle \
+    --enable-slirp \
+    --enable-zstd \
     --disable-gcrypt \
     --disable-gnutls \
     --disable-sdl \

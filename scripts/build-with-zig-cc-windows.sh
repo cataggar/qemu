@@ -2,7 +2,7 @@
 #
 # Cross-compile qemu-img/qemu-io for Windows (x86_64-windows-gnu) from a
 # Linux runner, using `zig cc`/`zig c++` as the compiler and *our own*
-# zig-built glib/pixman/libiconv/gettext/zlib instead of MSYS2/vcpkg (see
+# zig-built glib/pixman/libiconv/gettext/zlib/zstd instead of MSYS2/vcpkg (see
 # https://github.com/cataggar/qemu/issues/17). This is the true-cross-compile
 # follow-up to scripts/build-with-zig-cc.sh, which only builds natively.
 #
@@ -26,9 +26,10 @@
 #       https://github.com/cataggar/libiconv
 #       https://github.com/cataggar/gettext
 #       https://github.com/cataggar/zlib
-#     at ../pixman, ../glib, ../libiconv, ../gettext, ../zlib (relative to
-#     this qemu checkout), or point QEMU_ZIG_DEPS_DIR at a directory
-#     containing them.
+#       https://github.com/cataggar/zstd
+#     at ../pixman, ../glib, ../libiconv, ../gettext, ../zlib, ../zstd
+#     (relative to this qemu checkout), or point QEMU_ZIG_DEPS_DIR at a
+#     directory containing them.
 #
 # nettle is intentionally not built/wired here: with an empty --target-list
 # (--disable-system, no linux-user/bsd-user targets), QEMU's meson.build
@@ -48,7 +49,7 @@ ZIG_TARGET=x86_64-windows-gnu
 export ZIG_TARGET   # read by scripts/zig-cc-windows-defs/rc-preprocessor.sh
 CROSS_PREFIX=x86_64-w64-mingw32-
 
-DEPS="pixman glib libiconv gettext zlib"
+DEPS="pixman glib libiconv gettext zlib zstd"
 
 for dep in $DEPS; do
   dep_dir="$DEPS_DIR/$dep"
@@ -74,7 +75,7 @@ write_pc() {
   { [ -n "$vars" ] && printf '%s\n' "$vars"
     cat <<EOF
 Name: $name
-Description: zig cc build of $name for $ZIG_TARGET (see cataggar/$name, zig16 branch)
+Description: zig cc build of $name for $ZIG_TARGET
 Version: $version
 Cflags: $cflags
 Libs: $libs
@@ -85,6 +86,10 @@ EOF
 write_pc zlib 1.3.2 \
   "-I$DEPS_DIR/zlib/zig-out/include" \
   "-L$DEPS_DIR/zlib/zig-out/lib -lz"
+
+write_pc libzstd 1.6.0 \
+  "-I$DEPS_DIR/zstd/zig-out/include" \
+  "-L$DEPS_DIR/zstd/zig-out/lib -lzstd"
 
 write_pc pixman-1 0.46.5 \
   "-I$DEPS_DIR/pixman/zig-out/include/pixman-1" \
@@ -151,6 +156,7 @@ cd "$BUILD_DIR"
     --cxx="zig c++ -target $ZIG_TARGET" \
     --target-list= \
     --enable-tools \
+    --enable-zstd \
     --disable-system \
     --disable-guest-agent \
     --disable-werror \
