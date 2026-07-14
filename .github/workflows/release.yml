@@ -1,8 +1,8 @@
 name: Release
 
 # Builds qemu-img/qemu-io plus a native qemu-system-<arch> (with hardware
-# acceleration) for Linux, macOS, and Windows, with `zig cc` from a chosen
-# commit of cataggar/qemu, and publishes them as a GitHub Release.
+# acceleration) for Linux, macOS, and Windows, with `zig cc` from the
+# workflow's current commit, and publishes them as a GitHub Release.
 #
 # This is the zig16-branch counterpart of the `ghr`-branch release.yml.
 # The Linux/macOS jobs are native builds (native package managers for
@@ -40,12 +40,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      qemu_ref:
-        description: >-
-          Commit-ish (branch, tag, or SHA) in cataggar/qemu to build.
-          Defaults to the latest commit on zig16.
-        required: false
-        default: zig16
       version:
         description: 'Release tag to create, e.g. v2026.07.09'
         required: true
@@ -91,11 +85,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Checkout QEMU (${{ inputs.qemu_ref }})
+      - name: Checkout current QEMU commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: cataggar/qemu
-          ref: ${{ inputs.qemu_ref }}
           fetch-depth: 0
 
       - name: Record resolved commit
@@ -133,11 +125,10 @@ jobs:
 
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (Linux)
         if: runner.os == 'Linux'
-        # Mirrors scripts/build-with-zig-cc.sh on the zig16 branch (inlined
-        # here so this works against any qemu_ref, including commits that
-        # predate that script), but only builds the tool/system binaries
-        # this release packages instead of the full `ninja` (all targets)
-        # build. --bindir=/--with-suffix= (both empty) make the built
+        # Mirrors scripts/build-with-zig-cc.sh on the current commit, but
+        # only builds the tool/system binaries this release packages instead
+        # of the full `ninja` (all targets) build.
+        # --bindir=/--with-suffix= (both empty) make the built
         # binary and its share/ firmware directory sibling directories at
         # runtime (get_relocated_path() in util/cutils.c), matching how
         # they'll be laid out in the release package below.
@@ -345,18 +336,15 @@ jobs:
     # zig-windows-system-cross.yml: not yet promoted to a required check.
     continue-on-error: true
     steps:
-      - name: Checkout QEMU (${{ inputs.qemu_ref }})
+      - name: Checkout current QEMU commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: cataggar/qemu
-          ref: ${{ inputs.qemu_ref }}
           fetch-depth: 0
           path: qemu
 
       # Sibling checkouts of the zig-built dependencies (see issues #17/#20
       # for how each was built and verified). Pinned to their own zig16
-      # branches regardless of qemu_ref: these are independent of the QEMU
-      # source tree being built.
+      # branches, independent of the current QEMU commit being built.
       - name: Checkout pixman
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -432,9 +420,7 @@ jobs:
 
       - name: Build qemu-img.exe/qemu-io.exe/qemu-system-x86_64.exe with zig cc
         # Everything below is inlined (not scripts/build-with-zig-cc-windows*.sh
-        # from the checked-out qemu_ref) so this works against any qemu_ref,
-        # including commits that predate those scripts -- same rationale as
-        # the Linux/macOS jobs' inlined build steps above. See
+        # from the checkout), matching the Linux/macOS build steps above. See
         # scripts/build-with-zig-cc-windows-system.sh on this repo's zig16
         # branch for the (documented, currently-in-sync) non-release version
         # of this same build, and https://github.com/cataggar/qemu/issues/20
@@ -576,15 +562,6 @@ jobs:
           EOF
           chmod +x "$DEFS_DIR/rc-preprocessor.sh"
           export WINDRES="${CROSS_PREFIX}windres --preprocessor=$DEFS_DIR/rc-preprocessor.sh"
-
-          # The Windows+clang "needs lld" linker-id check only makes sense
-          # for plugin support (delaylib), per its own comment, but
-          # (depending on qemu_ref) may still be enforced unconditionally.
-          # zig cc always links with its own bundled lld but reports a
-          # linker id of 'ld.zigcc' rather than 'ld.lld', tripping this
-          # check even with --disable-plugins. Gate it on plugins (a no-op,
-          # if qemu_ref already has this fix committed).
-          sed -i "s/compiler.get_linker_id() != 'ld.lld'/compiler.get_linker_id() != 'ld.lld' and get_option('plugins')/" "$SRC_DIR/meson.build"
 
           # -DGLIB_STATIC_COMPILATION: without it, glib's headers declare
           # functions with __declspec(dllimport) (glib assumes a shared
