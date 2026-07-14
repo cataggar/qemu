@@ -783,7 +783,7 @@ jobs:
           target_commitish: ${{ needs.build.outputs.qemu_sha }}
           name: qemu ${{ inputs.version }}
           body: |
-            Installable with [ghr](https://cataggar.github.io/ghr/):
+            Install with [ghr](https://cataggar.github.io/ghr/):
 
             ```
             ghr install cataggar/qemu@${{ inputs.version }}
