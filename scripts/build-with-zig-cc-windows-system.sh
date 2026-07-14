@@ -39,7 +39,7 @@ ZIG_TARGET=x86_64-windows-gnu
 export ZIG_TARGET   # read by scripts/zig-cc-windows-defs/rc-preprocessor.sh
 CROSS_PREFIX=x86_64-w64-mingw32-
 
-DEPS="pixman glib libiconv gettext zlib nettle"
+DEPS="pixman glib libiconv gettext zlib zstd nettle"
 
 for dep in $DEPS; do
   dep_dir="$DEPS_DIR/$dep"
@@ -56,13 +56,14 @@ BUILD_DIR="$(cd "$BUILD_DIR" && pwd)"
 PC_DIR="$BUILD_DIR/pkgconfig"
 
 # See scripts/build-with-zig-cc-windows.sh for the rationale behind this
-# helper and the glib-2.0/pixman-1/zlib .pc contents; nettle.pc is new here.
+# helper and the glib-2.0/pixman-1/zlib/libzstd .pc contents; nettle.pc is
+# new here.
 write_pc() {
   local name="$1" version="$2" cflags="$3" libs="$4" vars="${5:-}"
   { [ -n "$vars" ] && printf '%s\n' "$vars"
     cat <<EOF
 Name: $name
-Description: zig cc build of $name for $ZIG_TARGET (see cataggar/$name, zig16 branch)
+Description: zig cc build of $name for $ZIG_TARGET
 Version: $version
 Cflags: $cflags
 Libs: $libs
@@ -73,6 +74,10 @@ EOF
 write_pc zlib 1.3.2 \
   "-I$DEPS_DIR/zlib/zig-out/include" \
   "-L$DEPS_DIR/zlib/zig-out/lib -lz"
+
+write_pc libzstd 1.6.0 \
+  "-I$DEPS_DIR/zstd/zig-out/include" \
+  "-L$DEPS_DIR/zstd/zig-out/lib -lzstd"
 
 write_pc pixman-1 0.46.5 \
   "-I$DEPS_DIR/pixman/zig-out/include/pixman-1" \
@@ -126,6 +131,7 @@ cd "$BUILD_DIR"
     --enable-tools \
     --enable-whpx \
     --enable-nettle \
+    --enable-zstd \
     --disable-gcrypt \
     --disable-gnutls \
     --disable-sdl \
