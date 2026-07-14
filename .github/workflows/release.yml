@@ -38,11 +38,17 @@ name: Release
 # hardware (see issue #20's writeup -- GitHub-hosted Windows runners don't
 # support nested virtualization, so this can't be runtime-tested in CI).
 on:
+  push:
+    tags:
+      - 'v*-z.*'
   workflow_dispatch:
     inputs:
       version:
         description: 'Release tag to create, e.g. v2026.07.09'
         required: true
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
 
 permissions:
   contents: write
@@ -157,7 +163,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
-            --with-pkgversion="${{ inputs.version }}" \
+            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
             --target-list="${{ matrix.system_target }}" \
             ${{ matrix.accel_opt }} \
             --bindir= \
@@ -189,7 +195,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
-            --with-pkgversion="${{ inputs.version }}" \
+            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
             --target-list="$OTHER_TARGETS" \
             --bindir= \
             --with-suffix= \
@@ -216,7 +222,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
-            --with-pkgversion="${{ inputs.version }}" \
+            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
             --target-list="${{ matrix.system_target }}" \
             --without-default-features \
             --enable-tools \
@@ -250,7 +256,7 @@ jobs:
           ../configure \
             --cc="zig cc" \
             --cxx="zig c++" \
-            --with-pkgversion="${{ inputs.version }}" \
+            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
             --target-list="$OTHER_TARGETS" \
             --without-default-features \
             --enable-tools \
@@ -307,7 +313,7 @@ jobs:
 
       - name: Package
         run: |
-          PKGNAME="qemu-${{ inputs.version }}-${{ matrix.name }}"
+          PKGNAME="qemu-${{ env.RELEASE_VERSION }}-${{ matrix.name }}"
           mkdir -p "$PKGNAME/share"
           cp build-zig/qemu-img build-zig/qemu-io "build-zig/${{ matrix.system_bin }}" "$PKGNAME/"
           # See the Verify binaries step above for why this must exclude
@@ -576,7 +582,7 @@ jobs:
               --cross-prefix="$CROSS_PREFIX" \
               --cc="zig cc -target $ZIG_TARGET" \
               --cxx="zig c++ -target $ZIG_TARGET" \
-              --with-pkgversion="${{ inputs.version }}" \
+              --with-pkgversion="${{ env.RELEASE_VERSION }}" \
               --target-list=x86_64-softmmu \
               --enable-tools \
               --enable-whpx \
@@ -651,7 +657,7 @@ jobs:
               --cross-prefix="$CROSS_PREFIX" \
               --cc="zig cc -target $ZIG_TARGET" \
               --cxx="zig c++ -target $ZIG_TARGET" \
-              --with-pkgversion="${{ inputs.version }}" \
+              --with-pkgversion="${{ env.RELEASE_VERSION }}" \
               --target-list="$OTHER_TARGETS" \
               --enable-tools \
               --enable-nettle \
@@ -703,7 +709,7 @@ jobs:
 
       - name: Package
         run: |
-          PKGNAME="qemu-${{ inputs.version }}-windows-x64"
+          PKGNAME="qemu-${{ env.RELEASE_VERSION }}-windows-x64"
           mkdir -p "$PKGNAME/share"
           cp build-zig-windows/qemu-img.exe build-zig-windows/qemu-io.exe build-zig-windows/qemu-system-x86_64.exe "$PKGNAME/"
           cp build-zig-windows-other/qemu-system-*.exe "$PKGNAME/"
@@ -756,14 +762,14 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
-          tag_name: ${{ inputs.version }}
+          tag_name: ${{ env.RELEASE_VERSION }}
           target_commitish: ${{ needs.build.outputs.qemu_sha }}
-          name: qemu ${{ inputs.version }}
+          name: qemu ${{ env.RELEASE_VERSION }}
           body: |
             Install with [ghr](https://cataggar.github.io/ghr/):
 
             ```
-            ghr install cataggar/qemu@${{ inputs.version }}
+            ghr install cataggar/qemu@${{ env.RELEASE_VERSION }}
             ```
           files: qemu-*
           draft: false
