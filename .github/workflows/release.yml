@@ -5,9 +5,10 @@ name: Release
 # workflow's current commit, and publishes them as a GitHub Release.
 #
 # This is the zig16-branch counterpart of the `ghr`-branch release.yml.
-# The Linux/macOS jobs are native builds (native package managers for
-# glib2/pixman) and now also build a qemu-system-<arch> matching the
-# runner's own host architecture (x86_64 on linux-x64, aarch64 on
+# The Linux jobs use Zig-managed target libraries and musl to produce fully
+# static executables. The macOS job remains a native build using Homebrew
+# target libraries. Both build a qemu-system-<arch> matching the runner's
+# own host architecture (x86_64 on linux-x64, aarch64 on
 # linux-arm64/macos-arm64), each with the accelerator available on that
 # host: KVM on Linux, HVF on macOS. Neither is runtime-tested in CI: Linux
 # runners have no /dev/kvm, and while macOS runners do run on real Apple
@@ -108,9 +109,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             bash bc bison bzip2 ca-certificates ccache findutils flex gcc git \
-            libc6-dev libfdt-dev libffi-dev libglib2.0-dev libpixman-1-dev \
-            libslirp-dev locales make ninja-build pkgconf python3 python3-venv \
-            sed tar
+            libc6-dev locales make ninja-build pkgconf python3 python3-venv sed tar
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -131,50 +130,14 @@ jobs:
 
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (Linux)
         if: runner.os == 'Linux'
-        # Mirrors scripts/build-with-zig-cc.sh on the current commit, but
-        # only builds the tool/system binaries this release packages instead
-        # of the full `ninja` (all targets) build.
-        # --bindir=/--with-suffix= (both empty) make the built
-        # binary and its share/ firmware directory sibling directories at
-        # runtime (get_relocated_path() in util/cutils.c), matching how
-        # they'll be laid out in the release package below.
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            aarch64|arm64) ASM_ARCH=asm-arm64 ;;
-            x86_64|amd64)  ASM_ARCH=asm-x86 ;;
-            *) echo "unsupported host arch $(uname -m)" >&2; exit 1 ;;
-          esac
-
-          BUILD_DIR="$PWD/build-zig"
-          mkdir -p "$BUILD_DIR"
-
-          # Real copy of linux-headers at a distinct path (zig cc ranks
-          # -isystem below /usr/include and de-dups a path given as both
-          # -I and -isystem down to the lower-priority slot).
-          HDR_COPY="$BUILD_DIR/zig-linux-headers-copy"
-          rm -rf "$HDR_COPY"
-          cp -r linux-headers "$HDR_COPY"
-          ln -sfn "$ASM_ARCH" "$HDR_COPY/asm"
-
-          EXTRA_FLAGS="-UNDEBUG -I$HDR_COPY"
-
-          cd "$BUILD_DIR"
-          ../configure \
-            --cc="zig cc" \
-            --cxx="zig c++" \
-            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
-            --target-list="${{ matrix.system_target }}" \
-            ${{ matrix.accel_opt }} \
-            --bindir= \
-            --with-suffix= \
-            --disable-werror \
-            --disable-plugins \
-            --enable-slirp \
-            --enable-strip \
-            --extra-cflags="$EXTRA_FLAGS" \
-            --extra-cxxflags="$EXTRA_FLAGS"
-          ninja qemu-img qemu-io "${{ matrix.system_bin }}"
+          export QEMU_PKG_VERSION="${{ env.RELEASE_VERSION }}"
+          export QEMU_ZIG_ACCEL_OPT="${{ matrix.accel_opt }}"
+          scripts/build-static-linux-with-zig.sh \
+            build-zig \
+            "${{ matrix.system_target }}" \
+            qemu-img qemu-io "${{ matrix.system_bin }}"
 
       - name: Build other (non-accelerated) qemu-system-* targets (Linux)
         if: runner.os == 'Linux'
@@ -186,26 +149,15 @@ jobs:
           set -euo pipefail
           ALL_TARGETS="$(cd configs/targets && ls *-softmmu.mak | sed 's/\.mak$//')"
           OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx '${{ matrix.system_target }}' | paste -sd, -)"
-
-          BUILD_DIR="$PWD/build-zig-other"
-          mkdir -p "$BUILD_DIR"
-          EXTRA_FLAGS="-UNDEBUG -I$PWD/build-zig/zig-linux-headers-copy"
-
-          cd "$BUILD_DIR"
-          ../configure \
-            --cc="zig cc" \
-            --cxx="zig c++" \
-            --with-pkgversion="${{ env.RELEASE_VERSION }}" \
-            --target-list="$OTHER_TARGETS" \
-            --bindir= \
-            --with-suffix= \
-            --disable-werror \
-            --disable-plugins \
-            --enable-slirp \
-            --enable-strip \
-            --extra-cflags="$EXTRA_FLAGS" \
-            --extra-cxxflags="$EXTRA_FLAGS"
-          ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
+          mapfile -t SYSTEM_BINS < <(
+            echo "$OTHER_TARGETS" | tr ',' '\n' |
+              sed -e 's/-softmmu$//' -e 's/^/qemu-system-/'
+          )
+          export QEMU_PKG_VERSION="${{ env.RELEASE_VERSION }}"
+          scripts/build-static-linux-with-zig.sh \
+            build-zig-other \
+            "$OTHER_TARGETS" \
+            "${SYSTEM_BINS[@]}"
 
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (macOS)
         if: runner.os == 'macOS'
@@ -310,6 +262,17 @@ jobs:
           # too, we only want the final signed binary.
           find build-zig-other -maxdepth 1 -type f -name 'qemu-system-*' ! -name '*-unsigned' -print0 |
             while IFS= read -r -d '' bin; do "$bin" --version; done
+          if [ "${{ runner.os }}" = Linux ]; then
+            find build-zig build-zig-other -maxdepth 1 -type f \
+              \( -name 'qemu-img' -o -name 'qemu-io' -o -name 'qemu-system-*' \) \
+              -print0 |
+              while IFS= read -r -d '' bin; do
+                file "$bin" | grep -q 'statically linked'
+                readelf -d "$bin" 2>&1 | grep -q 'There is no dynamic section'
+              done
+            build-zig/${{ matrix.system_bin }} -netdev help 2>&1 |
+              grep -qx 'user'
+          fi
 
       - name: Package
         run: |
@@ -326,6 +289,11 @@ jobs:
           # it must be a sibling of the binaries above (empty
           # --bindir=/--with-suffix= at configure time, see build step).
           cp -r pc-bios/* "$PKGNAME/share/"
+          if [ "${{ runner.os }}" = Linux ]; then
+            mkdir -p "$PKGNAME/share/licenses"
+            cp -r zig-out-static-deps/share/licenses/qemu-deps \
+              "$PKGNAME/share/licenses/"
+          fi
           cp COPYING "$PKGNAME/" 2>/dev/null || true
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
 
@@ -347,65 +315,6 @@ jobs:
         with:
           fetch-depth: 0
           path: qemu
-
-      # Sibling checkouts of the zig-built dependencies (see issues #17/#20
-      # for how each was built and verified). Pinned to their own zig16
-      # branches, independent of the current QEMU commit being built.
-      - name: Checkout pixman
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/pixman
-          ref: zig16
-          path: pixman
-
-      - name: Checkout glib
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/glib
-          ref: zig16
-          path: glib
-
-      - name: Checkout libiconv
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/libiconv
-          ref: zig16
-          path: libiconv
-
-      - name: Checkout gettext
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/gettext
-          ref: zig16
-          path: gettext
-
-      - name: Checkout zlib
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/zlib
-          ref: zig16
-          path: zlib
-
-      - name: Checkout zstd
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/zstd
-          ref: zig16
-          path: zstd
-
-      - name: Checkout nettle
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/nettle
-          ref: zig16
-          path: nettle
-
-      - name: Checkout libslirp
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: cataggar/libslirp
-          ref: zig16
-          path: libslirp
 
       - name: Install zig cc via ghr
         uses: cataggar/ghr/actions/install@v0.6.6
@@ -436,59 +345,21 @@ jobs:
 
           ZIG_TARGET=x86_64-windows-gnu
           CROSS_PREFIX=x86_64-w64-mingw32-
-          DEPS_DIR="$PWD"
           SRC_DIR="$PWD/qemu"
           BUILD_DIR="$PWD/build-zig-windows"
+          SYSROOT="$PWD/zig-out-windows-deps"
+          mkdir -p "$BUILD_DIR" "$SYSROOT"
 
-          for dep in pixman glib libiconv gettext zlib zstd nettle libslirp; do
-            echo "== building $dep for $ZIG_TARGET =="
-            ( cd "$DEPS_DIR/$dep" && zig build -Dtarget="$ZIG_TARGET" -Doptimize=ReleaseFast )
-          done
+          (
+            cd "$SRC_DIR"
+            zig build deps \
+              -Dtarget="$ZIG_TARGET" \
+              -Doptimize=ReleaseFast \
+              --prefix "$SYSROOT"
+          )
 
-          mkdir -p "$BUILD_DIR/pkgconfig"
-          PC_DIR="$BUILD_DIR/pkgconfig"
-
-          write_pc() {
-            local name="$1" version="$2" cflags="$3" libs="$4" vars="${5:-}"
-            { [ -n "$vars" ] && printf '%s\n' "$vars"
-              cat <<EOF
-          Name: $name
-          Description: zig cc build of $name for $ZIG_TARGET
-          Version: $version
-          Cflags: $cflags
-          Libs: $libs
-          EOF
-            } > "$PC_DIR/$name.pc"
-          }
-
-          write_pc zlib 1.3.2 \
-            "-I$DEPS_DIR/zlib/zig-out/include" \
-            "-L$DEPS_DIR/zlib/zig-out/lib -lz"
-
-          write_pc libzstd 1.6.0 \
-            "-I$DEPS_DIR/zstd/zig-out/include" \
-            "-L$DEPS_DIR/zstd/zig-out/lib -lzstd"
-
-          write_pc pixman-1 0.46.5 \
-            "-I$DEPS_DIR/pixman/zig-out/include/pixman-1" \
-            "-L$DEPS_DIR/pixman/zig-out/lib -lpixman-1"
-
-          write_pc glib-2.0 2.89.1 \
-            "-I$DEPS_DIR/glib/zig-out/include" \
-            "-L$DEPS_DIR/glib/zig-out/lib -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32" \
-            "prefix=$DEPS_DIR/glib/zig-out
-          bindir=\${prefix}/bin"
-
-          write_pc nettle 4.0 \
-            "-I$DEPS_DIR/nettle/zig-out/include" \
-            "-L$DEPS_DIR/nettle/zig-out/lib -lnettle"
-
-          write_pc slirp 4.9.3 \
-            "-I$DEPS_DIR/libslirp/zig-out/include/slirp -DLIBSLIRP_STATIC" \
-            "-L$DEPS_DIR/libslirp/zig-out/lib -lslirp -lglib-2.0 -liconv -lintl -lws2_32 -lwinmm -lole32 -lshell32 -liphlpapi"
-
-          export PKG_CONFIG_PATH="$PC_DIR"
-          export PKG_CONFIG_LIBDIR="$PC_DIR"
+          export PKG_CONFIG_PATH="$SYSROOT/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$SYSROOT/lib/pkgconfig"
           export PKG_CONFIG=pkg-config
 
           # zig's bundled mingw-w64 subset doesn't include the libpathcch.a/
@@ -574,8 +445,8 @@ jobs:
           # DLL), and lld-link refuses to resolve those against our plain
           # static glib-2.0.lib. See cataggar/qemu#20 for the full
           # rationale, including why --static isn't used instead.
-          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION"
-          EXTRA_LDFLAGS="-L$IMPLIB_DIR"
+          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION -I$SYSROOT/include"
+          EXTRA_LDFLAGS="-L$IMPLIB_DIR -L$SYSROOT/lib"
 
           cd "$BUILD_DIR"
           "$SRC_DIR/configure" \
@@ -629,11 +500,12 @@ jobs:
           CROSS_PREFIX=x86_64-w64-mingw32-
           SRC_DIR="$PWD/qemu"
           PREV_BUILD_DIR="$PWD/build-zig-windows"
+          SYSROOT="$PWD/zig-out-windows-deps"
           BUILD_DIR="$PWD/build-zig-windows-other"
           mkdir -p "$BUILD_DIR"
 
-          export PKG_CONFIG_PATH="$PREV_BUILD_DIR/pkgconfig"
-          export PKG_CONFIG_LIBDIR="$PREV_BUILD_DIR/pkgconfig"
+          export PKG_CONFIG_PATH="$SYSROOT/lib/pkgconfig"
+          export PKG_CONFIG_LIBDIR="$SYSROOT/lib/pkgconfig"
           export PKG_CONFIG=pkg-config
           export WINDRES="${CROSS_PREFIX}windres --preprocessor=$PREV_BUILD_DIR/defs/rc-preprocessor.sh"
 
@@ -649,8 +521,8 @@ jobs:
           # separate (build-machine) glib -- out of scope here.
           OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx -e x86_64-softmmu -e hexagon-softmmu | paste -sd, -)"
 
-          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION"
-          EXTRA_LDFLAGS="-L$PREV_BUILD_DIR/windows-import-libs"
+          EXTRA_FLAGS="-UNDEBUG -DGLIB_STATIC_COMPILATION -I$SYSROOT/include"
+          EXTRA_LDFLAGS="-L$PREV_BUILD_DIR/windows-import-libs -L$SYSROOT/lib"
 
           cd "$BUILD_DIR"
           "$SRC_DIR/configure" \
@@ -736,6 +608,9 @@ jobs:
             bzip2 -dc "$firmware" > "$PKGNAME/share/$(basename "$firmware" .bz2)"
           done
           rm "$PKGNAME/share/"*.fd.bz2
+          mkdir -p "$PKGNAME/share/licenses"
+          cp -r zig-out-windows-deps/share/licenses/qemu-deps \
+            "$PKGNAME/share/licenses/"
           cp qemu/COPYING "$PKGNAME/" 2>/dev/null || true
           zip -r "$PKGNAME.zip" "$PKGNAME"
 
