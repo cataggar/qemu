@@ -289,7 +289,10 @@ jobs:
                 fi
               done
             NETDEV_STATUS=0
-            NETDEV_BACKENDS="$(build-zig/${{ matrix.system_bin }} -netdev help 2>&1)" ||
+            NETDEV_BACKENDS="$(
+              build-zig/${{ matrix.system_bin }} \
+                -machine none -accel tcg -netdev help 2>&1
+            )" ||
               NETDEV_STATUS=$?
             printf '%s\n' "$NETDEV_BACKENDS"
             if [ "$NETDEV_STATUS" -ne 0 ]; then
