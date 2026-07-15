@@ -267,11 +267,21 @@ jobs:
               \( -name 'qemu-img' -o -name 'qemu-io' -o -name 'qemu-system-*' \) \
               -print0 |
               while IFS= read -r -d '' bin; do
-                file "$bin" | grep -q 'statically linked'
-                readelf -d "$bin" 2>&1 | grep -q 'There is no dynamic section'
+                file "$bin"
+                PROGRAM_HEADERS="$(readelf -lW "$bin")"
+                DYNAMIC_SECTION="$(readelf -dW "$bin" 2>&1)"
+                if grep -q ' INTERP ' <<< "$PROGRAM_HEADERS"; then
+                  echo "$bin has an ELF interpreter" >&2
+                  exit 1
+                fi
+                if grep -q '(NEEDED)' <<< "$DYNAMIC_SECTION"; then
+                  echo "$bin has a dynamic library dependency" >&2
+                  exit 1
+                fi
               done
-            build-zig/${{ matrix.system_bin }} -netdev help 2>&1 |
-              grep -qx 'user'
+            NETDEV_BACKENDS="$(build-zig/${{ matrix.system_bin }} -netdev help 2>&1)"
+            printf '%s\n' "$NETDEV_BACKENDS"
+            grep -qx 'user' <<< "$NETDEV_BACKENDS"
           fi
 
       - name: Package
