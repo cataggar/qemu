@@ -1,6 +1,11 @@
 /GNUmakefile
 /build/
 /.cache/
+/.zig-cache/
+/zig-out/
+/zig-pkg/
+/build-static-*/
+/zig-out-*/
 /.vscode/
 *.pyc
 .sdk
