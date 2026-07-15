@@ -17,11 +17,15 @@ on:
   push:
     branches: [zig16]
     paths:
+      - 'build.zig'
+      - 'build.zig.zon'
       - 'scripts/build-with-zig-cc-windows-system.sh'
       - 'scripts/zig-cc-windows-defs/**'
       - '.github/workflows/zig-windows-system-cross.yml'
   pull_request:
     paths:
+      - 'build.zig'
+      - 'build.zig.zon'
       - 'scripts/build-with-zig-cc-windows-system.sh'
       - 'scripts/zig-cc-windows-defs/**'
       - '.github/workflows/zig-windows-system-cross.yml'
@@ -42,67 +46,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: qemu
-
-      # Sibling checkouts expected by
-      # scripts/build-with-zig-cc-windows-system.sh (as ../pixman, ../glib,
-      # ../libiconv, ../gettext, ../zlib, ../zstd, ../nettle, ../libslirp
-      # relative to the qemu checkout). Same as zig-windows-cross.yml,
-      # plus nettle (system crypto) and libslirp (user-mode networking).
-      - name: Checkout pixman
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/pixman
-          ref: zig16
-          path: pixman
-
-      - name: Checkout glib
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/glib
-          ref: zig16
-          path: glib
-
-      - name: Checkout libiconv
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/libiconv
-          ref: zig16
-          path: libiconv
-
-      - name: Checkout gettext
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/gettext
-          ref: zig16
-          path: gettext
-
-      - name: Checkout zlib
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/zlib
-          ref: zig16
-          path: zlib
-
-      - name: Checkout zstd
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/zstd
-          ref: zig16
-          path: zstd
-
-      - name: Checkout nettle
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/nettle
-          ref: zig16
-          path: nettle
-
-      - name: Checkout libslirp
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/libslirp
-          ref: zig16
-          path: libslirp
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.4

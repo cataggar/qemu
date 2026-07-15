@@ -12,11 +12,15 @@ on:
   push:
     branches: [zig16]
     paths:
+      - 'build.zig'
+      - 'build.zig.zon'
       - 'scripts/build-with-zig-cc-windows.sh'
       - 'scripts/zig-cc-windows-defs/**'
       - '.github/workflows/zig-windows-cross.yml'
   pull_request:
     paths:
+      - 'build.zig'
+      - 'build.zig.zon'
       - 'scripts/build-with-zig-cc-windows.sh'
       - 'scripts/zig-cc-windows-defs/**'
       - '.github/workflows/zig-windows-cross.yml'
@@ -38,52 +42,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: qemu
-
-      # Sibling checkouts expected by scripts/build-with-zig-cc-windows.sh
-      # (as ../pixman, ../glib, ../libiconv, ../gettext, ../zlib, ../zstd
-      # relative to the qemu checkout). Each dependency has a hand-written
-      # build.zig on its zig16 branch.
-      - name: Checkout pixman
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/pixman
-          ref: zig16
-          path: pixman
-
-      - name: Checkout glib
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/glib
-          ref: zig16
-          path: glib
-
-      - name: Checkout libiconv
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/libiconv
-          ref: zig16
-          path: libiconv
-
-      - name: Checkout gettext
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/gettext
-          ref: zig16
-          path: gettext
-
-      - name: Checkout zlib
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/zlib
-          ref: zig16
-          path: zlib
-
-      - name: Checkout zstd
-        uses: actions/checkout@v4
-        with:
-          repository: cataggar/zstd
-          ref: zig16
-          path: zstd
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.4

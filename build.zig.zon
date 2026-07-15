@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+.{
+    .name = .qemu_deps,
+    .version = "11.0.50",
+    .fingerprint = 0x8e7cb44512d17525,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .glib = .{
+            .url = "https://github.com/cataggar/glib/archive/80b7993b8ebc8ef4e1ec7cfddd0058fc9f240288.tar.gz",
+            .hash = "glib-2.89.1-QlvaJRd9-wDAK1A57kjQVV2CbvgZGtBgzunXwx__us3H",
+        },
+        .libslirp = .{
+            .url = "https://github.com/cataggar/libslirp/archive/02e78324f0a57a705a641ae013b20f2044809d6f.tar.gz",
+            .hash = "libslirp-4.9.3-W1ZX1U0gCQBRmDjOWUsSL3Ezxn0J7JMPgUulBu3cIUyd",
+        },
+        .pixman = .{
+            .url = "https://github.com/cataggar/pixman/archive/bc2f0a842540de7580eac2b5e3a643a5bbd10e81.tar.gz",
+            .hash = "pixman-0.46.5-5KHo4NDUHwBayqQhmh74tGhqos_NWHr6NjZ82VzwOjTT",
+        },
+        .zlib = .{
+            .url = "https://github.com/cataggar/zlib/archive/b4e57365ac3c84121c99a51c54eb02a5e4b16c86.tar.gz",
+            .hash = "zlib-1.3.2-Nw5YbZEKNwAuh6XJs-vzogSoSv5jdL3PBhOI98q_QUu0",
+        },
+        .zstd = .{
+            .url = "https://github.com/cataggar/zstd/archive/45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
+            .hash = "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+        },
+        .nettle = .{
+            .url = "https://github.com/cataggar/nettle/archive/282489f7f55ef0979908bd7f9ee05c9a2030d168.tar.gz",
+            .hash = "nettle-4.0.0-XoawCjsDagBYSs5MCXvUuok9MKv_9elJw5DCT23R3_9n",
+        },
+        .libfdt = .{
+            .url = "https://github.com/cataggar/dtc/archive/5adb74f3ec3821a0c14d79bbcc12e819e7021d97.tar.gz",
+            .hash = "libfdt-1.8.1-YI8sUsVYAwACWzWiJUk6XOBFj2G24euROYDJ5m_VlOhI",
+        },
+        .gettext = .{
+            .url = "https://github.com/cataggar/gettext/archive/a1d7f044f8c71f6e80587b4c687945f0a405d3fd.tar.gz",
+            .hash = "gettext-0.26.0-GleY_bRnDACeSHT1A6KVpQxGsUTtaRuK6pclFv-6uKGq",
+        },
+        .libiconv = .{
+            .url = "https://github.com/cataggar/libiconv/archive/d54d0446137856b4c60f4eeb070b7d11743444ea.tar.gz",
+            .hash = "libiconv-1.19.0-dJQYZzz-ZABtg-x9Rc6PkHexdRt6_o83t9iv7qlUwgYp",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "COPYING",
+    },
+}
