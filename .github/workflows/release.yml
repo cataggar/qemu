@@ -106,6 +106,15 @@ jobs:
         # Package list is QEMU's own documented minimal build environment,
         # see docs/devel/build-environment.rst (qemu-minimal.yml via lcitool).
         run: |
+          if [ "${{ runner.arch }}" = ARM64 ]; then
+            # The hosted ARM64 image includes these tools, including Ninja
+            # outside dpkg. Avoid ports.ubuntu.com here: transient outages
+            # must not block a build that needs no additional packages.
+            for tool in bash bc bison bzip2 flex gcc git make ninja pkg-config python3 sed tar; do
+              command -v "$tool"
+            done
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             bash bc bison bzip2 ca-certificates ccache findutils flex gcc git \
