@@ -7,12 +7,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .glib = .{
-            .url = "https://github.com/cataggar/glib/archive/80b7993b8ebc8ef4e1ec7cfddd0058fc9f240288.tar.gz",
-            .hash = "glib-2.89.1-QlvaJRd9-wDAK1A57kjQVV2CbvgZGtBgzunXwx__us3H",
+            .url = "https://github.com/cataggar/glib/archive/561acfe17ba868e5b07097a546f3320669fce8c0.tar.gz",
+            .hash = "glib-2.89.1-QlvaJfB_-wDPuzbnapdYaBnmF7CcZ8gIncwJ923slG9Y",
         },
         .libslirp = .{
-            .url = "https://github.com/cataggar/libslirp/archive/02e78324f0a57a705a641ae013b20f2044809d6f.tar.gz",
-            .hash = "libslirp-4.9.3-W1ZX1U0gCQBRmDjOWUsSL3Ezxn0J7JMPgUulBu3cIUyd",
+            .url = "https://github.com/cataggar/libslirp/archive/678235e7221f0787d015519e6976f676f837c527.tar.gz",
+            .hash = "libslirp-4.9.3-W1ZX1cIgCQAgBzeHMhv_xVXHXyHQF-hOpy_RoEyj2159",
         },
         .pixman = .{
             .url = "https://github.com/cataggar/pixman/archive/bc2f0a842540de7580eac2b5e3a643a5bbd10e81.tar.gz",
@@ -33,10 +33,6 @@
         .libfdt = .{
             .url = "https://github.com/cataggar/dtc/archive/5adb74f3ec3821a0c14d79bbcc12e819e7021d97.tar.gz",
             .hash = "libfdt-1.8.1-YI8sUsVYAwACWzWiJUk6XOBFj2G24euROYDJ5m_VlOhI",
-        },
-        .gettext = .{
-            .url = "https://github.com/cataggar/gettext/archive/a1d7f044f8c71f6e80587b4c687945f0a405d3fd.tar.gz",
-            .hash = "gettext-0.26.0-GleY_bRnDACeSHT1A6KVpQxGsUTtaRuK6pclFv-6uKGq",
         },
         .libiconv = .{
             .url = "https://github.com/cataggar/libiconv/archive/d54d0446137856b4c60f4eeb070b7d11743444ea.tar.gz",

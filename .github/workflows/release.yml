@@ -6,8 +6,9 @@ name: Release
 #
 # This is the zig16-branch counterpart of the `ghr`-branch release.yml.
 # The Linux jobs use Zig-managed target libraries and musl to produce fully
-# static executables. The macOS job remains a native build using Homebrew
-# target libraries. Both build a qemu-system-<arch> matching the runner's
+# static executables. The macOS job uses Zig-built static GLib/libintl/
+# libslirp libraries and Homebrew pixman. Both build a qemu-system-<arch>
+# matching the runner's
 # own host architecture (x86_64 on linux-x64, aarch64 on
 # linux-arm64/macos-arm64), each with the accelerator available on that
 # host: KVM on Linux, HVF on macOS. Neither is runtime-tested in CI: Linux
@@ -76,13 +77,13 @@ jobs:
             system_bin: qemu-system-aarch64
             accel_opt: --enable-kvm
           # Native build (not cross-compiled): zig cc as the compiler, but
-          # dependencies (glib2/pixman) come from Homebrew. True
+          # pixman comes from Homebrew; GLib/libintl/libslirp are built
+          # statically with Zig. True
           # cross-compilation to macOS from Linux isn't covered by this
           # branch's work (see issue #17); only Windows is (see the
           # separate build-windows-cross job below).
           - os: macos-latest
             name: macos-arm64
-            experimental: true
             system_target: aarch64-softmmu
             system_bin: qemu-system-aarch64
             accel_opt: --enable-hvf
@@ -127,7 +128,7 @@ jobs:
         # build (even just for `configure`, via the hexagon target parser).
         run: |
           brew update
-          brew install bison flex glib libslirp pixman pkg-config ninja meson
+          brew install bison flex pixman pkg-config ninja meson
 
       - name: Install zig cc via ghr
         uses: cataggar/ghr/actions/install@v0.6.6
@@ -136,6 +137,13 @@ jobs:
         with:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build static macOS slirp dependencies
+        if: runner.os == 'macOS'
+        run: |
+          zig build deps-libslirp \
+            -Doptimize=ReleaseFast \
+            --prefix "$PWD/zig-out-macos-slirp"
 
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (Linux)
         if: runner.os == 'Linux'
@@ -172,7 +180,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
           # bison/flex are keg-only on macOS (Homebrew won't symlink them
           # into PATH since macOS ships its own, incompatible versions).
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -205,7 +213,7 @@ jobs:
         # doesn't disturb the accelerated build.
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 
           ALL_TARGETS="$(cd configs/targets && ls *-softmmu.mak | sed 's/\.mak$//')"
@@ -302,6 +310,25 @@ jobs:
               echo "${{ matrix.system_bin }} exited $NETDEV_STATUS without listing the user backend" >&2
               exit 1
             fi
+          elif [ "${{ runner.os }}" = macOS ]; then
+            find build-zig build-zig-other -maxdepth 1 -type f \
+              \( -name 'qemu-img' -o -name 'qemu-io' -o -name 'qemu-system-*' \) \
+              ! -name '*-unsigned' -print0 |
+              while IFS= read -r -d '' bin; do
+                if otool -L "$bin" | grep -E 'lib(slirp|glib-2\.0|intl).*\.dylib'; then
+                  echo "$bin dynamically links a dependency that must be static" >&2
+                  exit 1
+                fi
+              done
+            NETDEV_BACKENDS="$(
+              build-zig/${{ matrix.system_bin }} \
+                -machine none -accel tcg -netdev help 2>&1
+            )"
+            printf '%s\n' "$NETDEV_BACKENDS"
+            if ! grep -qx 'user' <<< "$NETDEV_BACKENDS"; then
+              echo "${{ matrix.system_bin }} did not list the user backend" >&2
+              exit 1
+            fi
           fi
 
       - name: Package
@@ -322,6 +349,10 @@ jobs:
           if [ "${{ runner.os }}" = Linux ]; then
             mkdir -p "$PKGNAME/share/licenses"
             cp -r zig-out-static-deps/share/licenses/qemu-deps \
+              "$PKGNAME/share/licenses/"
+          elif [ "${{ runner.os }}" = macOS ]; then
+            mkdir -p "$PKGNAME/share/licenses"
+            cp -r zig-out-macos-slirp/share/licenses/qemu-deps \
               "$PKGNAME/share/licenses/"
           fi
           cp COPYING "$PKGNAME/" 2>/dev/null || true
