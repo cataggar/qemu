@@ -7,7 +7,7 @@ name: Release
 # This is the zig16-branch counterpart of the `ghr`-branch release.yml.
 # The Linux jobs use Zig-managed target libraries and musl to produce fully
 # static executables. The macOS job uses Zig-built static GLib/libintl/
-# libslirp libraries and Homebrew pixman. Both build a qemu-system-<arch>
+# libslirp/Zstd libraries and Homebrew pixman. Both build a qemu-system-<arch>
 # matching the runner's
 # own host architecture (x86_64 on linux-x64, aarch64 on
 # linux-arm64/macos-arm64), each with the accelerator available on that
@@ -145,6 +145,23 @@ jobs:
             -Doptimize=ReleaseFast \
             --prefix "$PWD/zig-out-macos-slirp"
 
+      - name: Build static macOS Zstd dependency
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          PREFIX="$PWD/zig-out-macos-zstd"
+          zig build deps-zstd \
+            -Doptimize=ReleaseFast \
+            --prefix "$PREFIX"
+
+          test -f "$PREFIX/lib/libzstd.a"
+          test -f "$PREFIX/lib/pkgconfig/libzstd.pc"
+          test -f "$PREFIX/include/zstd.h"
+          test -f "$PREFIX/include/zstd_errors.h"
+          test -f "$PREFIX/share/licenses/qemu-deps/zstd/LICENSE"
+          test ! -e "$PREFIX/lib/libzstd.dylib"
+          lipo -info "$PREFIX/lib/libzstd.a"
+
       - name: Build qemu-img/qemu-io/${{ matrix.system_bin }} with zig cc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -180,13 +197,14 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$PWD/zig-out-macos-zstd/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
           # bison/flex are keg-only on macOS (Homebrew won't symlink them
           # into PATH since macOS ships its own, incompatible versions).
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 
           BUILD_DIR="$PWD/build-zig"
-          mkdir -p "$BUILD_DIR"
+          rm -rf "$BUILD_DIR"
+          mkdir "$BUILD_DIR"
           cd "$BUILD_DIR"
           ../configure \
             --cc="zig cc" \
@@ -201,9 +219,11 @@ jobs:
             --disable-werror \
             --disable-plugins \
             --enable-slirp \
+            --enable-zstd \
             --enable-strip \
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
+          grep -qx '#define CONFIG_ZSTD' config-host.h
           ninja qemu-img qemu-io "${{ matrix.system_bin }}"
 
       - name: Build other (non-accelerated) qemu-system-* targets (macOS)
@@ -213,14 +233,15 @@ jobs:
         # doesn't disturb the accelerated build.
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
+          export PKG_CONFIG_PATH="$PWD/zig-out-macos-slirp/lib/pkgconfig:$PWD/zig-out-macos-zstd/lib/pkgconfig:$(brew --prefix)/lib/pkgconfig"
           export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
 
           ALL_TARGETS="$(cd configs/targets && ls *-softmmu.mak | sed 's/\.mak$//')"
           OTHER_TARGETS="$(echo "$ALL_TARGETS" | grep -vx '${{ matrix.system_target }}' | paste -sd, -)"
 
           BUILD_DIR="$PWD/build-zig-other"
-          mkdir -p "$BUILD_DIR"
+          rm -rf "$BUILD_DIR"
+          mkdir "$BUILD_DIR"
           cd "$BUILD_DIR"
           ../configure \
             --cc="zig cc" \
@@ -234,9 +255,11 @@ jobs:
             --disable-werror \
             --disable-plugins \
             --enable-slirp \
+            --enable-zstd \
             --enable-strip \
             --extra-cflags="-UNDEBUG" \
             --extra-cxxflags="-UNDEBUG"
+          grep -qx '#define CONFIG_ZSTD' config-host.h
           ninja $(echo "$OTHER_TARGETS" | tr ',' '\n' | sed -e 's/-softmmu$//' -e 's/^/qemu-system-/')
 
       - name: Strip binaries (Linux)
@@ -354,9 +377,21 @@ jobs:
             mkdir -p "$PKGNAME/share/licenses"
             cp -r zig-out-macos-slirp/share/licenses/qemu-deps \
               "$PKGNAME/share/licenses/"
+            cp -r zig-out-macos-zstd/share/licenses/qemu-deps/zstd \
+              "$PKGNAME/share/licenses/qemu-deps/"
           fi
           cp COPYING "$PKGNAME/" 2>/dev/null || true
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+
+      - name: Verify packaged macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          PKGNAME="qemu-${{ env.RELEASE_VERSION }}-${{ matrix.name }}"
+          EXTRACT_DIR="$(mktemp -d)"
+          trap 'rm -rf "$EXTRACT_DIR"' EXIT
+          tar xzf "$PKGNAME.tar.gz" -C "$EXTRACT_DIR"
+          python3 scripts/ci/verify-macos-package.py "$EXTRACT_DIR/$PKGNAME"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

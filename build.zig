@@ -42,7 +42,8 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_slirp.step);
     b.installArtifact(pixman.artifact("pixman-1"));
     b.installArtifact(zlib.artifact("z"));
-    b.installArtifact(zstd.artifact("zstd"));
+    const install_zstd = b.addInstallArtifact(zstd.artifact("zstd"), .{});
+    b.getInstallStep().dependOn(&install_zstd.step);
     b.installArtifact(nettle.artifact("nettle"));
     b.installArtifact(libfdt.artifact("fdt"));
 
@@ -96,7 +97,7 @@ pub fn build(b: *std.Build) void {
         .cflags = "-I${includedir}",
         .libs = "-L${libdir} -lz",
     });
-    _ = installPkgConfig(b, pc_files, .{
+    const zstd_pc = installPkgConfig(b, pc_files, .{
         .file = "libzstd.pc",
         .name = "libzstd",
         .description = "Zstandard compression library",
@@ -125,7 +126,7 @@ pub fn build(b: *std.Build) void {
     const slirp_license = installLicense(b, libslirp.path("COPYRIGHT"), "libslirp/COPYRIGHT");
     _ = installLicense(b, pixman.path("COPYING"), "pixman/COPYING");
     _ = installLicense(b, zlib.path("LICENSE"), "zlib/LICENSE");
-    _ = installLicense(b, zstd.path("LICENSE"), "zstd/LICENSE");
+    const zstd_license = installLicense(b, zstd.path("LICENSE"), "zstd/LICENSE");
     _ = installLicense(b, nettle.path("COPYING.LESSERv3"), "nettle/COPYING.LESSERv3");
     _ = installLicense(b, nettle.path("COPYINGv2"), "nettle/COPYINGv2");
     _ = installLicense(b, libfdt.path("BSD-2-Clause"), "libfdt/BSD-2-Clause");
@@ -156,6 +157,14 @@ pub fn build(b: *std.Build) void {
     slirp_deps_step.dependOn(&slirp_license.step);
     if (libintl_license) |license|
         slirp_deps_step.dependOn(&license.step);
+
+    const zstd_deps_step = b.step(
+        "deps-zstd",
+        "Build and install the static Zstd dependency",
+    );
+    zstd_deps_step.dependOn(&install_zstd.step);
+    zstd_deps_step.dependOn(&zstd_pc.step);
+    zstd_deps_step.dependOn(&zstd_license.step);
 }
 
 const PkgConfig = struct {
