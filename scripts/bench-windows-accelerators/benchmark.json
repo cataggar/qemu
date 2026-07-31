@@ -1,0 +1,615 @@
+{
+  "schema": 1,
+  "description": "QEMU TCG, QEMU WHPX, and native Hyper-V benchmark matrix for issue #21",
+  "defaults": {
+    "ram_mib": 2048,
+    "vcpu_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "run_order_seed": 210721,
+    "minimum_free_disk_gib": 40,
+    "minimum_free_memory_mib": 4096,
+    "variance_warning_percent": 5
+  },
+  "profiles": {
+    "quick": {
+      "description": "Minimal smoke coverage for the micro guest and full Alpine guest",
+      "warmups": 1,
+      "repetitions": 2,
+      "vcpu_counts": [
+        1,
+        4
+      ],
+      "timeout_scale": 0.5,
+      "workload_ids": [
+        "prime-v1",
+        "full-boot"
+      ]
+    },
+    "core": {
+      "description": "CPU, SMP, memory, and boot coverage without disk or networking workloads",
+      "warmups": 1,
+      "repetitions": 10,
+      "vcpu_counts": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "timeout_scale": 1,
+      "workload_ids": [
+        "prime-v1",
+        "minimal-boot",
+        "prime-smp",
+        "memory-seq-read",
+        "memory-seq-write",
+        "memory-random",
+        "sysbench-cpu",
+        "sysbench-memory-seq-read",
+        "sysbench-memory-seq-write",
+        "sysbench-memory-random-read",
+        "sysbench-memory-random-write",
+        "full-boot"
+      ]
+    },
+    "full": {
+      "description": "Complete CPU, memory, disk, networking, and boot benchmark suite",
+      "warmups": 1,
+      "repetitions": 10,
+      "vcpu_counts": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "timeout_scale": 1,
+      "workload_ids": [
+        "prime-v1",
+        "minimal-boot",
+        "prime-smp",
+        "memory-seq-read",
+        "memory-seq-write",
+        "memory-random",
+        "sysbench-cpu",
+        "sysbench-memory-seq-read",
+        "sysbench-memory-seq-write",
+        "sysbench-memory-random-read",
+        "sysbench-memory-random-write",
+        "fio-sequential-read",
+        "fio-sequential-write",
+        "fio-random-read",
+        "fio-random-write",
+        "iperf-guest-to-host-one",
+        "iperf-guest-to-host-four",
+        "iperf-host-to-guest-one",
+        "iperf-host-to-guest-four",
+        "full-boot"
+      ]
+    }
+  },
+  "environments": [
+    {
+      "id": "qemu-tcg-single",
+      "runner": "qemu",
+      "accelerator": "tcg,thread=single",
+      "reference_only": false
+    },
+    {
+      "id": "qemu-tcg-multi",
+      "runner": "qemu",
+      "accelerator": "tcg,thread=multi",
+      "reference_only": false
+    },
+    {
+      "id": "qemu-whpx-irqchip-on",
+      "runner": "qemu",
+      "accelerator": "whpx,kernel-irqchip=on",
+      "reference_only": false
+    },
+    {
+      "id": "qemu-whpx-irqchip-off",
+      "runner": "qemu",
+      "accelerator": "whpx,kernel-irqchip=off",
+      "reference_only": false
+    },
+    {
+      "id": "hyperv",
+      "runner": "hyperv",
+      "accelerator": null,
+      "reference_only": false
+    },
+    {
+      "id": "wsl-reference",
+      "runner": "wsl",
+      "accelerator": null,
+      "reference_only": true
+    }
+  ],
+  "workloads": [
+    {
+      "id": "prime-v1",
+      "guest": "micro",
+      "metric_direction": "lower",
+      "vcpus": [
+        1
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 120,
+      "parameters": {
+        "prime_limit": 3000000
+      },
+      "known_answer": {
+        "metric": "prime_count",
+        "value": 216816
+      }
+    },
+    {
+      "id": "minimal-boot",
+      "guest": "micro",
+      "metric_direction": "lower",
+      "vcpus": [
+        1
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 120,
+      "parameters": {
+        "marker": "BENCH_READY"
+      },
+      "known_answer": null
+    },
+    {
+      "id": "prime-smp",
+      "guest": "micro",
+      "metric_direction": "lower",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 300,
+      "parameters": {
+        "prime_limit": 10000000
+      },
+      "known_answer": null
+    },
+    {
+      "id": "memory-seq-read",
+      "guest": "micro",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "working_set_mib": 512,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "memory-seq-write",
+      "guest": "micro",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "working_set_mib": 512,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "memory-random",
+      "guest": "micro",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "working_set_mib": 512,
+        "duration_seconds": 15,
+        "seed": 210721
+      },
+      "known_answer": null
+    },
+    {
+      "id": "sysbench-cpu",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": true,
+      "timeout_seconds": 180,
+      "parameters": {
+        "cpu_max_prime": 20000,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "sysbench-memory-seq-read",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": true,
+      "timeout_seconds": 180,
+      "parameters": {
+        "operation": "read",
+        "access_mode": "seq",
+        "block_size": "1M",
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "sysbench-memory-seq-write",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": true,
+      "timeout_seconds": 180,
+      "parameters": {
+        "operation": "write",
+        "access_mode": "seq",
+        "block_size": "1M",
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "sysbench-memory-random-read",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": true,
+      "timeout_seconds": 180,
+      "parameters": {
+        "operation": "read",
+        "access_mode": "rnd",
+        "block_size": "4K",
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "sysbench-memory-random-write",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-single",
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "hyperv"
+      ],
+      "allow_wsl_reference": true,
+      "timeout_seconds": 180,
+      "parameters": {
+        "operation": "write",
+        "access_mode": "rnd",
+        "block_size": "4K",
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "fio-sequential-read",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 300,
+      "parameters": {
+        "rw": "read",
+        "block_size": "1M",
+        "iodepth": 32,
+        "numjobs": 1,
+        "ramp_seconds": 5,
+        "duration_seconds": 30,
+        "precondition_pattern": "0x5a",
+        "data_size": "16G",
+        "direct": true
+      },
+      "known_answer": null
+    },
+    {
+      "id": "fio-sequential-write",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 300,
+      "parameters": {
+        "rw": "write",
+        "block_size": "1M",
+        "iodepth": 32,
+        "numjobs": 1,
+        "ramp_seconds": 5,
+        "duration_seconds": 30,
+        "precondition_pattern": "0x5a",
+        "data_size": "16G",
+        "direct": true
+      },
+      "known_answer": null
+    },
+    {
+      "id": "fio-random-read",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 300,
+      "parameters": {
+        "rw": "randread",
+        "block_size": "4K",
+        "iodepth": 32,
+        "numjobs": 4,
+        "ramp_seconds": 5,
+        "duration_seconds": 30,
+        "precondition_pattern": "0x5a",
+        "data_size": "16G",
+        "direct": true
+      },
+      "known_answer": null
+    },
+    {
+      "id": "fio-random-write",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 300,
+      "parameters": {
+        "rw": "randwrite",
+        "block_size": "4K",
+        "iodepth": 32,
+        "numjobs": 4,
+        "ramp_seconds": 5,
+        "duration_seconds": 30,
+        "precondition_pattern": "0x5a",
+        "data_size": "16G",
+        "direct": true
+      },
+      "known_answer": null
+    },
+    {
+      "id": "iperf-guest-to-host-one",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "direction": "guest-to-host",
+        "parallel_streams": 1,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "iperf-guest-to-host-four",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "direction": "guest-to-host",
+        "parallel_streams": 4,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "iperf-host-to-guest-one",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "direction": "host-to-guest",
+        "parallel_streams": 1,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "iperf-host-to-guest-four",
+      "guest": "system",
+      "metric_direction": "higher",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "direction": "host-to-guest",
+        "parallel_streams": 4,
+        "duration_seconds": 15
+      },
+      "known_answer": null
+    },
+    {
+      "id": "full-boot",
+      "guest": "system",
+      "metric_direction": "lower",
+      "vcpus": [
+        4
+      ],
+      "environments": [
+        "qemu-tcg-multi",
+        "qemu-whpx-irqchip-on",
+        "qemu-whpx-irqchip-off",
+        "hyperv"
+      ],
+      "allow_wsl_reference": false,
+      "timeout_seconds": 180,
+      "parameters": {
+        "markers": [
+          "first_serial_byte",
+          "BENCH_READY"
+        ]
+      },
+      "known_answer": null
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "end": {
+    "sum_sent": {
+      "bits_per_second": 1000000
+    },
+    "sum_received": {
+      "bits_per_second": 1000000
+    }
+  }
+}

@@ -6,6 +6,8 @@
 /zig-pkg/
 /build-static-*/
 /zig-out-*/
+/scripts/bench-windows-accelerators/out/
+/scripts/bench-windows-accelerators/results/
 /.vscode/
 *.pyc
 .sdk
