@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "created_utc": "2026-01-01T00:00:00+00:00",
+  "session_id": "fixture-session",
+  "profile": "test",
+  "configuration": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "warmups": 1,
+    "repetitions": 1,
+    "ram_mib": 2048
+  },
+  "repository": {
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "dirty": false
+  },
+  "host": {
+    "windows_caption": "Fixture Windows",
+    "windows_build": "1",
+    "computer_model": "Fixture Host",
+    "logical_processors": 8,
+    "total_memory_mib": 16384,
+    "active_power_plan": "Fixture Plan",
+    "cpu": [
+      {
+        "name": "Fixture CPU"
+      }
+    ]
+  },
+  "qemu": {
+    "version": "QEMU emulator version fixture",
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "firmware": {
+      "seabios": {
+        "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "edk2": {
+        "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "vars_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+      }
+    }
+  },
+  "guest_artifacts": {
+    "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "artifacts": []
+  },
+  "matrix": {
+    "planned_cells": 1,
+    "skipped_cells": 0,
+    "cells": [
+      {
+        "cell_id": "prime-v1__qemu-tcg-single__1vcpu",
+        "workload": "prime-v1",
+        "guest": "micro",
+        "environment": "qemu-tcg-single",
+        "runner": "qemu",
+        "accelerator": "tcg,thread=single",
+        "reference_only": false,
+        "vcpus": 1,
+        "ram_mib": 2048,
+        "warmups": 1,
+        "repetitions": 1,
+        "total_runs": 2,
+        "metric_direction": "lower",
+        "parameters": {
+          "prime_limit": 3000000
+        },
+        "known_answer": {
+          "metric": "prime_count",
+          "value": 216816
+        },
+        "status": "planned",
+        "skip_reason": null
+      }
+    ]
+  },
+  "run_order": [
+    {
+      "run_id": "prime-v1__qemu-tcg-single__1vcpu__warmup-01",
+      "schedule_index": 0,
+      "cell_id": "prime-v1__qemu-tcg-single__1vcpu",
+      "environment": "qemu-tcg-single",
+      "is_warmup": true,
+      "repetition": 1
+    },
+    {
+      "run_id": "prime-v1__qemu-tcg-single__1vcpu__measure-01",
+      "schedule_index": 1,
+      "cell_id": "prime-v1__qemu-tcg-single__1vcpu",
+      "environment": "qemu-tcg-single",
+      "is_warmup": false,
+      "repetition": 1
+    }
+  ]
+}

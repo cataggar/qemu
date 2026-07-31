@@ -1,0 +1,12 @@
+{
+  "jobs": [
+    {
+      "read": {
+        "bw_bytes": 1048576
+      },
+      "write": {
+        "bw_bytes": 0
+      }
+    }
+  ]
+}

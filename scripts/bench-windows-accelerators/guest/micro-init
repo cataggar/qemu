@@ -1,0 +1,84 @@
+#!/bin/busybox sh
+
+set -eu
+
+fail()
+{
+    message="$1"
+    printf 'BENCH_JSON {"schema":1,"run_id":"%s","workload":"guest-error","status":"error","message":"%s"}\n' \
+        "$BENCH_RUN_ID" "$message"
+    /bin/busybox sync
+    /bin/busybox sleep 1
+    /bin/busybox poweroff -f
+    while :; do /bin/busybox sleep 3600; done
+}
+
+/bin/busybox mkdir -p /proc /sys /dev /tmp
+test -e /proc/cmdline || /bin/busybox mount -t proc proc /proc ||
+    fail "unable to mount proc"
+test -e /sys/kernel || /bin/busybox mount -t sysfs sysfs /sys ||
+    fail "unable to mount sysfs"
+test -e /dev/null || /bin/busybox mount -t devtmpfs devtmpfs /dev ||
+    fail "unable to mount devtmpfs"
+
+BENCH_RUN_ID=phase2-smoke
+workloads=prime-v1
+prime_limit=10000000
+memory_mib=512
+duration_seconds=15
+
+for argument in $(/bin/busybox cat /proc/cmdline); do
+    case "$argument" in
+        bench.run_id=*) BENCH_RUN_ID="${argument#*=}" ;;
+        bench.workloads=*) workloads="${argument#*=}" ;;
+        bench.prime_limit=*) prime_limit="${argument#*=}" ;;
+        bench.memory_mib=*) memory_mib="${argument#*=}" ;;
+        bench.duration=*) duration_seconds="${argument#*=}" ;;
+    esac
+done
+
+case "$BENCH_RUN_ID" in
+    ''|*[!A-Za-z0-9._-]*) fail "invalid run ID" ;;
+esac
+for number in "$prime_limit" "$memory_mib" "$duration_seconds"; do
+    case "$number" in
+        ''|*[!0-9]*) fail "invalid numeric benchmark parameter" ;;
+    esac
+done
+case "$workloads" in
+    ''|*[!a-z0-9,-]*) fail "invalid workload list" ;;
+esac
+
+export BENCH_RUN_ID
+online_vcpus=$(/bin/busybox nproc)
+printf 'BENCH_READY run_id=%s\n' "$BENCH_RUN_ID"
+printf 'BENCH_JSON {"schema":1,"run_id":"%s","workload":"guest-metadata","metric":"online_vcpus","value":%s,"unit":"count","direction":"exact","status":"success"}\n' \
+    "$BENCH_RUN_ID" "$online_vcpus"
+
+old_ifs="$IFS"
+IFS=,
+set -- $workloads
+IFS="$old_ifs"
+
+for workload in "$@"; do
+    case "$workload" in
+        prime-v1)
+            /bin/microbench prime-v1 || fail "prime-v1 failed"
+            ;;
+        prime-smp)
+            /bin/microbench prime-smp "$prime_limit" || fail "prime-smp failed"
+            ;;
+        memory-seq-read|memory-seq-write|memory-random)
+            /bin/microbench "$workload" "$memory_mib" "$duration_seconds" ||
+                fail "$workload failed"
+            ;;
+        *)
+            fail "unsupported workload"
+            ;;
+    esac
+done
+
+/bin/busybox sync
+/bin/busybox sleep 1
+/bin/busybox poweroff -f
+while :; do /bin/busybox sleep 3600; done
