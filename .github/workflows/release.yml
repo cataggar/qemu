@@ -131,7 +131,7 @@ jobs:
           brew install bison flex pixman pkg-config ninja meson
 
       - name: Install zig cc via ghr
-        uses: cataggar/ghr/actions/install@v0.6.6
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -413,7 +413,7 @@ jobs:
           path: qemu
 
       - name: Install zig cc via ghr
-        uses: cataggar/ghr/actions/install@v0.6.6
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
