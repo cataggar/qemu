@@ -27,6 +27,7 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   cross-build:
@@ -44,7 +45,7 @@ jobs:
           path: qemu
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.4
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
